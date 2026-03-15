@@ -11,5 +11,5 @@ from bot.strategy.signal import Signal
 
 class Strategy(ABC):
     @abstractmethod
-    async def evaluate(self, market: Market, price_feed: BtcPriceFeed) -> Signal | None:
+    async def evaluate(self, market: Market, price_feed: BtcPriceFeed, window_open_price: float | None = None) -> Signal | None:
         """Return a Signal if there's a trade, None otherwise."""

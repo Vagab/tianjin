@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     max_position_usd: float = 100.0
     max_exposure_usd: float = 500.0
     max_daily_loss_usd: float = 200.0
-    kelly_fraction: float = 0.25
+    kelly_fraction: float = 0.60
     min_edge: float = 0.03
     estimated_taker_fee_pct: float = 0.02
 

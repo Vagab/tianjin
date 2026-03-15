@@ -44,7 +44,7 @@ class LiveExecutor(Executor):
         self.portfolio.balance_usd = balance
         return balance
 
-    async def execute(self, market: Market, direction: Direction, amount_usd: float) -> OrderResult:
+    async def execute(self, market: Market, direction: Direction, amount_usd: float, edge: float = 0.0) -> OrderResult:
         token_id = (
             market.up_token.token_id if direction == Direction.UP
             else market.down_token.token_id
@@ -55,9 +55,10 @@ class LiveExecutor(Executor):
             return OrderResult(success=False, error="Missing token ID")
 
         try:
-            # Use limit order at current market price for better fill rates
-            # (FOK market orders fail on thin books)
-            price = market.up_price if direction == Direction.UP else market.down_price
+            # Aggressive limit order: bump price by $0.02 to cross the spread
+            # and fill immediately (pure GTC at market price often sits unfilled)
+            base_price = market.up_price if direction == Direction.UP else market.down_price
+            price = min(round(base_price + 0.02, 2), 0.99)
             size = round(amount_usd / price, 2)  # shares = USD / price_per_share
 
             # Polymarket minimum for limit orders is 5 shares
@@ -85,7 +86,7 @@ class LiveExecutor(Executor):
                 resp,
             )
 
-            fill_price = market.up_price if direction == Direction.UP else market.down_price
+            fill_price = price  # actual price we submitted
             order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
 
             if success:
@@ -95,7 +96,7 @@ class LiveExecutor(Executor):
                     direction=direction,
                     amount_usd=amount_usd,
                     entry_price=fill_price,
-                    edge=0.0,
+                    edge=edge,
                     timestamp=time.time(),
                 ))
                 self.portfolio.open_positions.append(Position(
@@ -115,6 +116,19 @@ class LiveExecutor(Executor):
         except Exception as e:
             logger.error("Order execution failed: %s", e)
             return OrderResult(success=False, error=str(e))
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order. Returns True if cancelled."""
+        if not order_id:
+            return False
+        try:
+            resp = self._client.cancel(order_id)
+            cancelled = bool(resp) if not isinstance(resp, dict) else resp.get("canceled", False)
+            logger.info("Cancel order %s: %s", order_id, resp)
+            return cancelled
+        except Exception as e:
+            logger.error("Cancel failed for %s: %s", order_id, e)
+            return False
 
     def settle_position(self, market_slug: str, winning_direction: Direction):
         """Settle a position based on market outcome."""

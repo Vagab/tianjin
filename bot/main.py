@@ -65,6 +65,8 @@ class TradingBot:
         self._running = False
         self._last_daily_reset: float = 0
         self._state_file = Path(__file__).resolve().parent.parent / "bot_state.json"
+        self._traded_file = Path(__file__).resolve().parent.parent / "traded_markets.json"
+        self._traded_markets: set[str] = self._load_traded_markets()
 
     async def start(self):
         self._running = True
@@ -126,6 +128,22 @@ class TradingBot:
             self._save_state()
             logger.info("Initialized state: balance=$%.2f", current_balance)
 
+    def _load_traded_markets(self) -> set[str]:
+        """Load set of market slugs we've already traded (survives restarts)."""
+        try:
+            data = json.loads(self._traded_file.read_text())
+            return set(data.get("markets", []))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
+
+    def _mark_traded(self, market_slug: str):
+        """Record that we've traded this market window."""
+        self._traded_markets.add(market_slug)
+        # Keep only the last 20 to avoid unbounded growth
+        if len(self._traded_markets) > 20:
+            self._traded_markets = set(list(self._traded_markets)[-20:])
+        self._traded_file.write_text(json.dumps({"markets": list(self._traded_markets)}))
+
     def _save_state(self):
         import datetime
         today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
@@ -184,9 +202,22 @@ class TradingBot:
             await asyncio.sleep(30)
             return
 
+        # Skip markets we've already traded (prevents duplicates on restart)
+        if market.slug in self._traded_markets:
+            logger.info("Already traded %s, skipping to next window", market.slug)
+            remaining = market.end_ts - time.time()
+            if remaining > 0:
+                await asyncio.sleep(remaining + 2)
+            return
+
+        # Capture BTC price at window open — this is what the contract settles on
+        window_open_btc_price = self.price_feed.price_at(float(market.start_ts))
+        if window_open_btc_price is None:
+            window_open_btc_price = self.price_feed.current_price
+
         logger.info(
-            "Market: %s | Up=%.3f Down=%.3f",
-            market.slug, market.up_price, market.down_price,
+            "Market: %s | Up=%.3f Down=%.3f | BTC open=$%.2f",
+            market.slug, market.up_price, market.down_price, window_open_btc_price,
         )
 
         # Calculate time remaining in this window
@@ -203,6 +234,8 @@ class TradingBot:
         # 2. EVALUATE — check for signal every second during first 2 minutes
         traded = False
         trade_btc_price: float | None = None  # BTC price at time of trade
+        current_order_id: str | None = None  # track open order for cancel+replace
+        current_direction: Direction | None = None
         eval_duration = min(120, remaining - 30)  # stop 30s before end
         eval_end = now + eval_duration
 
@@ -216,22 +249,41 @@ class TradingBot:
                     market = fresh_market
                 last_refresh = now_t
 
-            signal = await self.strategy.evaluate(market, self.price_feed)
+            signal = await self.strategy.evaluate(market, self.price_feed, window_open_btc_price)
 
             if signal and signal.is_actionable:
+                # If we have an open order in the opposite direction, cancel it first
+                if current_order_id and current_direction and signal.direction != current_direction:
+                    logger.info(
+                        "Signal flipped %s → %s, cancelling order %s",
+                        current_direction.value, signal.direction.value, current_order_id,
+                    )
+                    if hasattr(self.executor, "cancel_order"):
+                        self.executor.cancel_order(current_order_id)
+                    current_order_id = None
+                    current_direction = None
+
+                # Skip if we already have an order in this direction
+                if current_order_id and current_direction == signal.direction:
+                    await asyncio.sleep(1)
+                    continue
+
                 # 3. RISK CHECK
                 portfolio = self.executor.portfolio
-
                 risk_check = self.risk.check(signal, portfolio)
 
                 if risk_check.allowed:
                     # 4. EXECUTE
                     result = await self.executor.execute(
-                        market, signal.direction, risk_check.position_size
+                        market, signal.direction, risk_check.position_size,
+                        edge=signal.edge,
                     )
 
                     if result.success:
                         traded = True
+                        self._mark_traded(market.slug)
+                        current_order_id = result.order_id
+                        current_direction = signal.direction
                         trade_btc_price = self.price_feed.current_price
                         # Sync balance and PnL from Polymarket
                         await self.executor.get_balance()
@@ -251,9 +303,11 @@ class TradingBot:
                             reasoning=signal.reasoning,
                         )
                     else:
-                        # Don't retry for 30s after a failed order
-                        logger.warning("Order failed: %s — cooling down", result.error)
-                        await asyncio.sleep(30)
+                        # Order might have gone through despite exception.
+                        # Track it so we don't place a contradicting order.
+                        current_order_id = result.order_id or "unknown"
+                        current_direction = signal.direction
+                        logger.warning("Order failed: %s — won't retry this direction", result.error)
                 else:
                     logger.debug("Risk blocked: %s", risk_check.reason)
 
@@ -267,26 +321,26 @@ class TradingBot:
 
         # 6. SETTLE — check outcome
         if traded:
-            await self._settle(market, trade_btc_price)
+            await self._settle(market, window_open_btc_price)
 
-    async def _settle(self, market: Market, trade_btc_price: float | None):
+    async def _settle(self, market: Market, window_open_price: float | None):
         """Check outcome and settle position."""
         try:
-            # Determine winner: compare BTC price at trade time vs now (after window)
+            # Determine winner: compare BTC price at window open vs window close
+            # This matches how Polymarket settles the binary contract
             end_price = self.price_feed.current_price
 
-            if trade_btc_price is None or end_price == 0:
-                # Fallback: try to get price from buffer at window start
-                trade_btc_price = self.price_feed.price_at(float(market.start_ts))
-                if trade_btc_price is None:
+            if window_open_price is None or end_price == 0:
+                window_open_price = self.price_feed.price_at(float(market.start_ts))
+                if window_open_price is None:
                     logger.error("Cannot determine outcome — no price data")
                     return
 
-            winning = Direction.UP if end_price >= trade_btc_price else Direction.DOWN
+            winning = Direction.UP if end_price >= window_open_price else Direction.DOWN
 
             logger.info(
-                "Settlement: BTC $%.2f -> $%.2f = %s",
-                trade_btc_price, end_price, winning.value,
+                "Settlement: BTC $%.2f (open) -> $%.2f (close) = %s",
+                window_open_price, end_price, winning.value,
             )
 
             # Settle via executor (works for both paper and live)

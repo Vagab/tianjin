@@ -116,6 +116,7 @@ class TelegramNotifier:
         )
         if reasoning:
             text += f"\n\n💡 <b>Why:</b> {reasoning}"
+        logger.info("Sending trade notification to Telegram")
         await self.send(text, with_buttons=True)
 
     async def notify_outcome(self, market: str, outcome: str, pnl: float, balance: float):

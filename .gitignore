@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.context/
+bot.log
+trades.jsonl

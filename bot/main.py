@@ -1,0 +1,290 @@
+"""Main event loop: discover → monitor → evaluate → execute → settle → repeat."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import signal
+import time
+
+from config.settings import settings
+from bot.market.discovery import MarketDiscovery
+from bot.market.models import Direction, Market
+from bot.price.feed import BtcPriceFeed
+from bot.strategy.momentum import MomentumStrategy
+from bot.execution.paper import PaperExecutor
+from bot.execution.client import LiveExecutor
+from bot.risk.manager import RiskManager
+from bot.telegram.bot import TelegramNotifier
+from bot.utils.logging import setup_logging
+from bot.utils.metrics import MetricsTracker
+
+logger = logging.getLogger(__name__)
+
+
+class TradingBot:
+    def __init__(self):
+        self.discovery = MarketDiscovery(interval_seconds=settings.interval_seconds)
+        self.price_feed = BtcPriceFeed(ws_url=settings.binance_ws_url)
+        self.strategy = MomentumStrategy(
+            lookback_seconds=settings.momentum_lookback_seconds,
+            min_move_pct=settings.momentum_min_move_pct,
+            fee_pct=settings.estimated_taker_fee_pct,
+            min_edge=settings.min_edge,
+        )
+        self.risk = RiskManager(
+            max_position_usd=settings.max_position_usd,
+            max_exposure_usd=settings.max_exposure_usd,
+            max_daily_loss_usd=settings.max_daily_loss_usd,
+            kelly_fraction=settings.kelly_fraction,
+            min_edge=settings.min_edge,
+        )
+        self.metrics = MetricsTracker()
+        self.telegram = TelegramNotifier(
+            token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+        )
+
+        if settings.paper_trading:
+            self.executor = PaperExecutor(initial_balance=1000.0)
+            logger.info("Running in PAPER trading mode")
+        else:
+            pk = settings.polymarket_private_key.get_secret_value()
+            if not pk:
+                raise ValueError("POLYMARKET_PRIVATE_KEY required for live trading")
+            self.executor = LiveExecutor(
+                host=settings.polymarket_host,
+                private_key=pk,
+                chain_id=settings.polymarket_chain_id,
+                funder=settings.polymarket_funder,
+            )
+            logger.info("Running in LIVE trading mode")
+
+        self._running = False
+        self._last_daily_reset: float = 0
+
+    async def start(self):
+        self._running = True
+
+        # Start subsystems
+        await self.price_feed.start()
+        await self.price_feed.wait_for_price()
+        logger.info("BTC price feed active: $%.2f", self.price_feed.current_price)
+
+        # Wire up Telegram
+        portfolio_getter = lambda: (
+            self.executor.portfolio if hasattr(self.executor, "portfolio") else None
+        )
+        self.telegram.set_dependencies(
+            portfolio_getter=portfolio_getter,
+            metrics=self.metrics,
+            risk_manager=self.risk,
+            stop_callback=self.stop,
+        )
+        await self.telegram.start()
+
+        balance = await self.executor.get_balance()
+        logger.info("Starting balance: $%.2f", balance)
+
+        # Main loop
+        try:
+            await self._run_loop()
+        except asyncio.CancelledError:
+            logger.info("Bot cancelled")
+        finally:
+            await self._shutdown()
+
+    def stop(self):
+        self._running = False
+
+    async def _shutdown(self):
+        logger.info("Shutting down...")
+        await self.price_feed.stop()
+        await self.telegram.stop()
+        await self.discovery.close()
+
+        if hasattr(self.executor, "portfolio"):
+            logger.info("Final: %s", self.metrics.summary(self.executor.portfolio))
+
+    async def _run_loop(self):
+        while self._running:
+            # Reset daily stats at midnight UTC
+            import datetime
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            today_key = now_utc.date().toordinal()
+            if today_key != self._last_daily_reset:
+                self._last_daily_reset = today_key
+                self.risk.reset_daily()
+                self.executor.portfolio.daily_pnl = 0.0
+                logger.info("Daily reset")
+
+            try:
+                await self._run_window()
+            except Exception as e:
+                logger.error("Window error: %s", e, exc_info=True)
+                await self.telegram.notify_error(str(e))
+                await asyncio.sleep(10)
+
+    async def _run_window(self):
+        # 1. DISCOVER current market
+        market = await self.discovery.get_current_market()
+        if not market:
+            logger.warning("No active market found, waiting...")
+            await asyncio.sleep(30)
+            return
+
+        logger.info(
+            "Market: %s | Up=%.3f Down=%.3f",
+            market.slug, market.up_price, market.down_price,
+        )
+
+        # Calculate time remaining in this window
+        now = time.time()
+        window_end = market.end_ts
+        remaining = window_end - now
+
+        if remaining < 30:
+            # Too close to end, wait for next window
+            logger.info("Window ending in %.0fs, waiting for next...", remaining)
+            await asyncio.sleep(remaining + 2)
+            return
+
+        # 2. EVALUATE — check for signal every second during first 2 minutes
+        traded = False
+        trade_btc_price: float | None = None  # BTC price at time of trade
+        eval_duration = min(120, remaining - 30)  # stop 30s before end
+        eval_end = now + eval_duration
+
+        last_refresh = 0.0
+        while time.time() < eval_end and self._running and not traded:
+            # Refresh market prices every 15 seconds (not every tick)
+            now_t = time.time()
+            if now_t - last_refresh > 15:
+                fresh_market = await self.discovery.get_current_market()
+                if fresh_market:
+                    market = fresh_market
+                last_refresh = now_t
+
+            signal = await self.strategy.evaluate(market, self.price_feed)
+
+            if signal and signal.is_actionable:
+                # 3. RISK CHECK
+                portfolio = self.executor.portfolio
+
+                risk_check = self.risk.check(signal, portfolio)
+
+                if risk_check.allowed:
+                    # 4. EXECUTE
+                    result = await self.executor.execute(
+                        market, signal.direction, risk_check.position_size
+                    )
+
+                    if result.success:
+                        traded = True
+                        trade_btc_price = self.price_feed.current_price
+                        logger.info(
+                            "Trade executed: %s $%.2f | edge=%.3f | BTC=$%.2f",
+                            signal.direction.value,
+                            risk_check.position_size,
+                            signal.edge,
+                            trade_btc_price,
+                        )
+                        await self.telegram.notify_trade(
+                            direction=signal.direction.value,
+                            amount=risk_check.position_size,
+                            edge=signal.edge,
+                            market=market.slug,
+                        )
+                else:
+                    logger.debug("Risk blocked: %s", risk_check.reason)
+
+            await asyncio.sleep(1)
+
+        # 5. WAIT for window to end
+        remaining = market.end_ts - time.time()
+        if remaining > 0:
+            logger.info("Waiting %.0fs for window to close...", remaining)
+            await asyncio.sleep(remaining + 5)  # extra 5s for settlement
+
+        # 6. SETTLE — check outcome
+        if traded:
+            await self._settle(market, trade_btc_price)
+
+    async def _settle(self, market: Market, trade_btc_price: float | None):
+        """Check outcome and settle position."""
+        try:
+            # Determine winner: compare BTC price at trade time vs now (after window)
+            end_price = self.price_feed.current_price
+
+            if trade_btc_price is None or end_price == 0:
+                # Fallback: try to get price from buffer at window start
+                trade_btc_price = self.price_feed.price_at(float(market.start_ts))
+                if trade_btc_price is None:
+                    logger.error("Cannot determine outcome — no price data")
+                    return
+
+            winning = Direction.UP if end_price >= trade_btc_price else Direction.DOWN
+
+            logger.info(
+                "Settlement: BTC $%.2f -> $%.2f = %s",
+                trade_btc_price, end_price, winning.value,
+            )
+
+            # Settle via executor (works for both paper and live)
+            if hasattr(self.executor, "settle_position"):
+                self.executor.settle_position(market.slug, winning)
+
+            # For live executor, refresh balance from chain
+            if not hasattr(self.executor, "settle_position"):
+                await self.executor.get_balance()
+
+            # Record outcome in risk manager
+            won = any(
+                t.outcome == "win"
+                for t in self.executor.portfolio.trades
+                if t.market_slug == market.slug
+            )
+            self.risk.record_outcome(won)
+
+            # Notify via Telegram and log
+            for trade in reversed(self.executor.portfolio.trades):
+                if trade.market_slug == market.slug and trade.outcome:
+                    await self.telegram.notify_outcome(
+                        market=market.slug,
+                        outcome=trade.outcome,
+                        pnl=trade.pnl,
+                        balance=self.executor.portfolio.balance_usd,
+                    )
+                    self.metrics.log_trade(trade)
+                    break
+
+            logger.info(
+                "Summary: %s",
+                self.metrics.summary(self.executor.portfolio),
+            )
+
+        except Exception as e:
+            logger.error("Settlement error: %s", e)
+
+
+def main():
+    setup_logging()
+    bot = TradingBot()
+
+    loop = asyncio.new_event_loop()
+
+    def handle_signal(sig, frame):
+        logger.info("Received signal %s, stopping...", sig)
+        bot.stop()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        loop.run_until_complete(bot.start())
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

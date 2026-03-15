@@ -1,0 +1,26 @@
+[project]
+name = "tianjin"
+version = "0.1.0"
+description = "Polymarket BTC short-term trading bot"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client>=0.34",
+    "pydantic-settings>=2.0",
+    "websockets>=12.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "python-telegram-bot>=21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["bot*", "config*"]
+
+[project.scripts]
+tianjin = "bot.main:main"

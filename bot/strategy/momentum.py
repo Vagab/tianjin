@@ -1,11 +1,14 @@
-"""V2 Momentum Strategy.
+"""V3 Momentum + Order Flow Strategy.
 
-Requires multiple confirmations before trading:
-1. Momentum magnitude above threshold
-2. Consistent move (not a spike-and-fade)
-3. RSI confirmation (not fighting the trend)
-4. Move is accelerating (not exhausted)
-5. Sufficient edge after fees
+Signal flow:
+1. Momentum magnitude check (hard gate)
+2. Logistic with k=200 → base predicted_prob
+3. Consistency → soft dampener on predicted_prob
+4. TFI (Trade Flow Imbalance) → boost or dampen/kill
+5. VWAP deviation → mean-reversion guard
+6. Volatility dampening
+7. RSI + acceleration → minor confidence adjustments
+8. Edge check against market price + fees
 """
 
 from __future__ import annotations
@@ -21,7 +24,9 @@ from bot.price.indicators import (
     momentum_consistency,
     price_acceleration,
     rsi,
+    trade_flow_imbalance,
     volatility,
+    vwap_deviation,
 )
 from bot.strategy.base import Strategy
 from bot.strategy.signal import Signal
@@ -44,108 +49,128 @@ class MomentumStrategy(Strategy):
 
     async def evaluate(self, market: Market, price_feed: BtcPriceFeed) -> Signal | None:
         prices = price_feed.prices_since(self.lookback_seconds)
+        ticks = price_feed.ticks_since(self.lookback_seconds)
 
         if len(prices) < 15:
             return None
 
         mom = momentum(prices)
 
-        # Skip if move is too small
+        # --- HARD GATE: minimum move ---
         if abs(mom) < self.min_move_pct:
             return None
 
         direction = Direction.UP if mom > 0 else Direction.DOWN
 
-        # --- FILTER 1: Consistency ---
-        # The move should be steady, not a single spike
-        consistency = momentum_consistency(prices, segments=3)
-        if consistency < 0.67:
-            logger.debug(
-                "Skip: inconsistent move (%.0f%% segments agree, need 67%%)",
-                consistency * 100,
-            )
-            return None
-
-        # --- FILTER 2: Acceleration ---
-        # Prefer moves that are accelerating, not exhausted
-        accel = price_acceleration(prices)
-        move_accelerating = (direction == Direction.UP and accel > 0) or (
-            direction == Direction.DOWN and accel < 0
-        )
-
-        # --- FILTER 3: RSI confirmation ---
-        rsi_val = rsi(prices)
-        rsi_confirms = (direction == Direction.UP and rsi_val > 55) or (
-            direction == Direction.DOWN and rsi_val < 45
-        )
-
-        # Require at least one of acceleration or RSI to confirm
-        if not move_accelerating and not rsi_confirms:
-            logger.debug(
-                "Skip: no confirmation (accel=%.4f%% rsi=%.1f dir=%s)",
-                accel, rsi_val, direction.value,
-            )
-            return None
-
-        # --- PROBABILITY ESTIMATE ---
-        # Logistic function: maps absolute momentum to probability of our direction
-        # Calibrated: 0.03% → ~57%, 0.05% → ~62%, 0.1% → ~73%, 0.3% → ~95%
-        k = 500.0
+        # --- BASE PROBABILITY ---
+        # k=200: 0.03%→~53%, 0.05%→~55%, 0.1%→~60%, 0.3%→~73%
+        # More conservative than k=500, lets TFI/VWAP do the heavy lifting
+        k = 200.0
         predicted_prob = 1 / (1 + math.exp(-k * abs(mom) / 100))
 
-        # Adjust for volatility regime — high vol reduces confidence
+        # --- CONSISTENCY (soft dampener, not hard gate) ---
+        consistency = momentum_consistency(prices, segments=3)
+        # Scale: 0.33 → dampen to 33% of edge, 0.67 → 67%, 1.0 → full
+        predicted_prob = 0.5 + (predicted_prob - 0.5) * max(0.33, consistency)
+
+        # --- TFI: Trade Flow Imbalance (primary confirmation) ---
+        tfi = trade_flow_imbalance(ticks)
+        tfi_aligned = (direction == Direction.UP and tfi > 0) or (
+            direction == Direction.DOWN and tfi < 0
+        )
+        tfi_opposing = (direction == Direction.UP and tfi < -0.2) or (
+            direction == Direction.DOWN and tfi > 0.2
+        )
+
+        # TFI opposing the move = flow doesn't support the price action → kill
+        if tfi_opposing:
+            logger.debug(
+                "Skip: TFI %.2f opposes %s move (mom=%.4f%%)",
+                tfi, direction.value, mom,
+            )
+            return None
+
+        # TFI aligned boosts probability proportionally
+        if tfi_aligned:
+            tfi_boost = min(0.08, abs(tfi) * 0.1)  # max +8% boost
+            predicted_prob += tfi_boost
+
+        # --- VWAP DEVIATION (mean-reversion guard) ---
+        vwap_dev = vwap_deviation(ticks)
+        # If price is extended in our direction, the move may revert
+        price_extended = (direction == Direction.UP and vwap_dev > 0.15) or (
+            direction == Direction.DOWN and vwap_dev < -0.15
+        )
+        # If price is against our direction but flow supports it = buying into weakness
+        buying_weakness = (direction == Direction.UP and vwap_dev < -0.05 and tfi_aligned) or (
+            direction == Direction.DOWN and vwap_dev > 0.05 and tfi_aligned
+        )
+
+        if price_extended:
+            # Dampen — move may be exhausted
+            predicted_prob = 0.5 + (predicted_prob - 0.5) * 0.7
+        elif buying_weakness:
+            # Extra confidence — flow supports despite price lag
+            predicted_prob = min(0.90, predicted_prob + 0.03)
+
+        # --- VOLATILITY DAMPENING ---
         vol = volatility(prices)
         if vol > 0.0005:
             vol_factor = min(1.0, 0.0005 / vol)
             predicted_prob = 0.5 + (predicted_prob - 0.5) * max(0.3, vol_factor)
 
-        # Boost probability if both confirmations agree
-        if move_accelerating and rsi_confirms:
-            predicted_prob = 0.5 + (predicted_prob - 0.5) * 1.1
-            predicted_prob = min(0.98, predicted_prob)
+        # Clamp
+        predicted_prob = max(0.50, min(0.95, predicted_prob))
 
-        # Get current market price for our direction
+        # --- EDGE CHECK ---
         market_prob = market.up_price if direction == Direction.UP else market.down_price
-
-        # Edge = predicted probability - market price - fees
         edge = predicted_prob - market_prob - self.fee_pct
 
         if edge < self.min_edge:
             logger.debug(
-                "Skip: edge=%.4f < min %.4f (pred=%.3f mkt=%.3f mom=%.4f%%)",
-                edge, self.min_edge, predicted_prob, market_prob, mom,
+                "Skip: edge=%.4f < %.4f (pred=%.3f mkt=%.3f mom=%.4f%% tfi=%.2f)",
+                edge, self.min_edge, predicted_prob, market_prob, mom, tfi,
             )
             return None
 
-        # --- CONFIDENCE ---
+        # --- CONFIDENCE (from secondary signals) ---
+        rsi_val = rsi(prices)
+        rsi_confirms = (direction == Direction.UP and rsi_val > 55) or (
+            direction == Direction.DOWN and rsi_val < 45
+        )
+        accel = price_acceleration(prices)
+        move_accelerating = (direction == Direction.UP and accel > 0) or (
+            direction == Direction.DOWN and accel < 0
+        )
+
         confidence = min(0.95, 0.5 + abs(mom) / 0.5)
         confirmations = 0
+        if tfi_aligned and abs(tfi) > 0.3:
+            confirmations += 1
+            confidence = min(0.95, confidence + 0.05)
         if rsi_confirms:
             confirmations += 1
-            confidence = min(0.95, confidence + 0.05)
+            confidence = min(0.95, confidence + 0.03)
         if move_accelerating:
             confirmations += 1
-            confidence = min(0.95, confidence + 0.05)
+            confidence = min(0.95, confidence + 0.03)
         if consistency == 1.0:
             confirmations += 1
-            confidence = min(0.95, confidence + 0.05)
 
         # --- REASONING ---
-        reasons = []
-        reasons.append(f"BTC {mom:+.3f}% in {self.lookback_seconds}s")
-        reasons.append(f"consistency {consistency:.0%}")
-        if move_accelerating:
-            reasons.append(f"accelerating ({accel:+.4f}%)")
-        else:
-            reasons.append(f"decelerating ({accel:+.4f}%)")
-        reasons.append(f"RSI {rsi_val:.0f} {'confirms' if rsi_confirms else 'neutral'}")
-        reasons.append(f"vol {vol:.6f}")
+        tfi_label = "buying" if tfi > 0 else "selling"
+        tfi_strength = "strong" if abs(tfi) > 0.3 else "mild"
+        vwap_label = f"{'above' if vwap_dev > 0 else 'below'} VWAP by {abs(vwap_dev):.3f}%"
 
         reasoning = (
             f"Pred {predicted_prob:.0%} {direction.value} vs market {market_prob:.0%} "
             f"→ {edge:.1%} edge. "
-            + ", ".join(reasons)
-            + f". {confirmations}/3 confirmations."
+            f"BTC {mom:+.3f}% in {self.lookback_seconds}s, "
+            f"TFI {tfi:+.2f} ({tfi_strength} {tfi_label}), "
+            f"{vwap_label}, "
+            f"consistency {consistency:.0%}, "
+            f"RSI {rsi_val:.0f}. "
+            f"{confirmations}/4 confirmations."
         )
 
         signal = Signal(
@@ -159,8 +184,8 @@ class MomentumStrategy(Strategy):
         )
 
         logger.info(
-            "Signal: %s | mom=%.4f%% | pred=%.3f | mkt=%.3f | edge=%.3f | conf=%.2f | confirms=%d",
-            direction.value, mom, predicted_prob, market_prob, edge, confidence, confirmations,
+            "Signal: %s | mom=%.4f%% | tfi=%.2f | vwap=%.3f%% | pred=%.3f | mkt=%.3f | edge=%.3f | conf=%.2f",
+            direction.value, mom, tfi, vwap_dev, predicted_prob, market_prob, edge, confidence,
         )
 
         return signal

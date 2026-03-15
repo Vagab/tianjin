@@ -75,8 +75,8 @@ class RiskManager:
 
         # Position sizing via quarter-Kelly
         size = self._kelly_size(signal, portfolio.balance_usd)
-        if size < 1.0:
-            return RiskCheck(allowed=False, reason="Kelly size too small (<$1)")
+        if size < 2.5:
+            return RiskCheck(allowed=False, reason=f"Kelly size too small (${size:.2f})")
 
         self._last_trade_time = now
         return RiskCheck(allowed=True, position_size=size)

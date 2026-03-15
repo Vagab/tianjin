@@ -19,6 +19,7 @@ class PriceTick:
     price: float
     timestamp: float
     volume: float = 0.0
+    is_buyer_maker: bool = False  # True = seller aggressor, False = buyer aggressor
 
 
 class BtcPriceFeed:
@@ -49,6 +50,10 @@ class BtcPriceFeed:
     def prices_since(self, seconds_ago: float) -> list[float]:
         cutoff = time.time() - seconds_ago
         return [t.price for t in self._ticks if t.timestamp >= cutoff]
+
+    def ticks_since(self, seconds_ago: float) -> list[PriceTick]:
+        cutoff = time.time() - seconds_ago
+        return [t for t in self._ticks if t.timestamp >= cutoff]
 
     def price_at(self, target_time: float) -> float | None:
         """Get the price closest to an absolute timestamp."""
@@ -102,6 +107,7 @@ class BtcPriceFeed:
             price=float(data["p"]),
             timestamp=float(data["T"]) / 1000.0,
             volume=float(data.get("q", 0)),
+            is_buyer_maker=bool(data.get("m", False)),
         )
         self._current_price = tick.price
         self._ticks.append(tick)

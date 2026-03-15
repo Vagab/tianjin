@@ -1,8 +1,12 @@
-"""Lightweight technical indicators computed over price lists."""
+"""Lightweight technical indicators computed over price lists and tick data."""
 
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bot.price.feed import PriceTick
 
 
 def momentum(prices: list[float]) -> float:
@@ -87,4 +91,44 @@ def price_acceleration(prices: list[float]) -> float:
     first_half = (prices[mid] - prices[0]) / prices[0] * 100
     second_half = (prices[-1] - prices[mid]) / prices[mid] * 100
     return second_half - first_half
+
+
+def trade_flow_imbalance(ticks: list[PriceTick]) -> float:
+    """Trade Flow Imbalance: (buy_vol - sell_vol) / total_vol.
+
+    Range: -1 (all selling) to +1 (all buying).
+    Binance: m=False → buyer was aggressor (buy), m=True → seller was aggressor (sell).
+    """
+    if not ticks:
+        return 0.0
+    buy_vol = sum(t.volume for t in ticks if not t.is_buyer_maker)
+    sell_vol = sum(t.volume for t in ticks if t.is_buyer_maker)
+    total = buy_vol + sell_vol
+    if total == 0:
+        return 0.0
+    return (buy_vol - sell_vol) / total
+
+
+def vwap(ticks: list[PriceTick]) -> float:
+    """Volume-Weighted Average Price."""
+    if not ticks:
+        return 0.0
+    total_pv = sum(t.price * t.volume for t in ticks)
+    total_vol = sum(t.volume for t in ticks)
+    if total_vol == 0:
+        return ticks[-1].price
+    return total_pv / total_vol
+
+
+def vwap_deviation(ticks: list[PriceTick]) -> float:
+    """(current_price - vwap) / vwap * 100.
+
+    Positive = price above fair value, negative = below.
+    """
+    if not ticks:
+        return 0.0
+    v = vwap(ticks)
+    if v == 0:
+        return 0.0
+    return (ticks[-1].price - v) / v * 100
 

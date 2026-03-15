@@ -59,6 +59,8 @@ class LiveExecutor(Executor):
             # (FOK market orders fail on thin books)
             price = market.up_price if direction == Direction.UP else market.down_price
             size = round(amount_usd / price, 2)  # shares = USD / price_per_share
+            if size < 5:
+                size = 5.0  # Polymarket minimum order size
 
             order_args = OrderArgs(
                 token_id=token_id,

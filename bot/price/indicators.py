@@ -44,3 +44,47 @@ def volatility(prices: list[float]) -> float:
     return math.sqrt(variance)
 
 
+def ema(prices: list[float], period: int = 10) -> float:
+    """Exponential Moving Average of the last `period` prices."""
+    if not prices:
+        return 0.0
+    k = 2 / (period + 1)
+    value = prices[0]
+    for p in prices[1:]:
+        value = p * k + value * (1 - k)
+    return value
+
+
+def momentum_consistency(prices: list[float], segments: int = 3) -> float:
+    """Fraction of sub-segments that agree on direction with the overall move.
+
+    Returns 0.0-1.0. Higher = move is steady, not a spike-and-fade.
+    """
+    if len(prices) < segments * 2:
+        return 0.0
+    overall = prices[-1] - prices[0]
+    if overall == 0:
+        return 0.0
+    seg_len = len(prices) // segments
+    agree = 0
+    for i in range(segments):
+        start = i * seg_len
+        end = start + seg_len if i < segments - 1 else len(prices)
+        seg_move = prices[end - 1] - prices[start]
+        if (seg_move > 0) == (overall > 0):
+            agree += 1
+    return agree / segments
+
+
+def price_acceleration(prices: list[float]) -> float:
+    """Is the move accelerating or decelerating?
+
+    Returns > 0 if second half moved more than first half (accelerating).
+    """
+    if len(prices) < 4:
+        return 0.0
+    mid = len(prices) // 2
+    first_half = (prices[mid] - prices[0]) / prices[0] * 100
+    second_half = (prices[-1] - prices[mid]) / prices[mid] * 100
+    return second_half - first_half
+

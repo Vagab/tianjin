@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BalanceAllowanceParams, MarketOrderArgs, OrderType
+from py_clob_client.clob_types import BalanceAllowanceParams, OrderArgs, OrderType
 
 from bot.execution.paper import Executor, OrderResult
 from bot.market.models import Direction, Market, PortfolioState, Position, TradeRecord
@@ -55,12 +55,19 @@ class LiveExecutor(Executor):
             return OrderResult(success=False, error="Missing token ID")
 
         try:
-            order_args = MarketOrderArgs(
+            # Use limit order at current market price for better fill rates
+            # (FOK market orders fail on thin books)
+            price = market.up_price if direction == Direction.UP else market.down_price
+            size = round(amount_usd / price, 2)  # shares = USD / price_per_share
+
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=amount_usd,
+                price=price,
+                size=size,
+                side="BUY",
             )
-            signed_order = self._client.create_market_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.FOK)
+            signed_order = self._client.create_order(order_args)
+            resp = self._client.post_order(signed_order, OrderType.GTC)
 
             success = resp.get("success", False) if isinstance(resp, dict) else bool(resp)
 

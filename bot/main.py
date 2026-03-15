@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 import time
+from pathlib import Path
 
 from config.settings import settings
 from bot.market.discovery import MarketDiscovery
@@ -62,6 +64,7 @@ class TradingBot:
 
         self._running = False
         self._last_daily_reset: float = 0
+        self._state_file = Path(__file__).resolve().parent.parent / "bot_state.json"
 
     async def start(self):
         self._running = True
@@ -80,11 +83,13 @@ class TradingBot:
             metrics=self.metrics,
             risk_manager=self.risk,
             stop_callback=self.stop,
+            balance_refresher=self._refresh_balance,
         )
         await self.telegram.start()
 
         balance = await self.executor.get_balance()
-        logger.info("Starting balance: $%.2f", balance)
+        self._load_or_init_state(balance)
+        logger.info("Starting balance: $%.2f (initial: $%.2f)", balance, self._initial_balance)
 
         # Main loop
         try:
@@ -96,6 +101,50 @@ class TradingBot:
 
     def stop(self):
         self._running = False
+
+    def _load_or_init_state(self, current_balance: float):
+        """Load persisted state (initial balance, daily start) or initialize."""
+        import datetime
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        try:
+            data = json.loads(self._state_file.read_text())
+            self._initial_balance = data["initial_balance"]
+            if data.get("daily_date") == today:
+                self._daily_start_balance = data["daily_start_balance"]
+            else:
+                self._daily_start_balance = current_balance
+                data["daily_start_balance"] = current_balance
+                data["daily_date"] = today
+                self._state_file.write_text(json.dumps(data))
+            # Prevent daily reset from re-triggering on restart
+            self._last_daily_reset = datetime.datetime.now(datetime.timezone.utc).date().toordinal()
+            logger.info("Loaded state: initial=$%.2f daily_start=$%.2f", self._initial_balance, self._daily_start_balance)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            self._initial_balance = current_balance
+            self._daily_start_balance = current_balance
+            self._last_daily_reset = datetime.datetime.now(datetime.timezone.utc).date().toordinal()
+            self._save_state()
+            logger.info("Initialized state: balance=$%.2f", current_balance)
+
+    def _save_state(self):
+        import datetime
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        self._state_file.write_text(json.dumps({
+            "initial_balance": self._initial_balance,
+            "daily_start_balance": self._daily_start_balance,
+            "daily_date": today,
+        }))
+
+    def _sync_pnl(self):
+        """Update portfolio PnL from actual balance difference."""
+        bal = self.executor.portfolio.balance_usd
+        self.executor.portfolio.total_pnl = bal - self._initial_balance
+        self.executor.portfolio.daily_pnl = bal - self._daily_start_balance
+
+    async def _refresh_balance(self):
+        """Refresh balance from Polymarket and sync PnL."""
+        await self.executor.get_balance()
+        self._sync_pnl()
 
     async def _shutdown(self):
         logger.info("Shutting down...")
@@ -115,8 +164,10 @@ class TradingBot:
             if today_key != self._last_daily_reset:
                 self._last_daily_reset = today_key
                 self.risk.reset_daily()
-                self.executor.portfolio.daily_pnl = 0.0
-                logger.info("Daily reset")
+                self._daily_start_balance = self.executor.portfolio.balance_usd
+                self._save_state()
+                self._sync_pnl()
+                logger.info("Daily reset (daily_start=$%.2f)", self._daily_start_balance)
 
             try:
                 await self._run_window()
@@ -182,6 +233,9 @@ class TradingBot:
                     if result.success:
                         traded = True
                         trade_btc_price = self.price_feed.current_price
+                        # Sync balance and PnL from Polymarket
+                        await self.executor.get_balance()
+                        self._sync_pnl()
                         logger.info(
                             "Trade executed: %s $%.2f | edge=%.3f | BTC=$%.2f",
                             signal.direction.value,
@@ -194,7 +248,12 @@ class TradingBot:
                             amount=risk_check.position_size,
                             edge=signal.edge,
                             market=market.slug,
+                            reasoning=signal.reasoning,
                         )
+                    else:
+                        # Don't retry for 30s after a failed order
+                        logger.warning("Order failed: %s — cooling down", result.error)
+                        await asyncio.sleep(30)
                 else:
                     logger.debug("Risk blocked: %s", risk_check.reason)
 
@@ -231,12 +290,11 @@ class TradingBot:
             )
 
             # Settle via executor (works for both paper and live)
-            if hasattr(self.executor, "settle_position"):
-                self.executor.settle_position(market.slug, winning)
+            self.executor.settle_position(market.slug, winning)
 
-            # For live executor, refresh balance from chain
-            if not hasattr(self.executor, "settle_position"):
-                await self.executor.get_balance()
+            # Always refresh balance and PnL from Polymarket
+            await self.executor.get_balance()
+            self._sync_pnl()
 
             # Record outcome in risk manager
             won = any(

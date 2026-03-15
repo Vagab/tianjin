@@ -15,6 +15,7 @@ class Signal:
     market_prob: float  # current Polymarket implied probability
     edge: float  # predicted_prob - market_prob - fee
     timestamp: float = 0.0
+    reasoning: str = ""
 
     @property
     def is_actionable(self) -> bool:

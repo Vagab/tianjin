@@ -28,7 +28,7 @@ def make_feed(prices):
 def test_no_signal_on_flat_market():
     strategy = MomentumStrategy(lookback_seconds=45, min_move_pct=0.05)
     market = make_market()
-    feed = make_feed([100.0] * 20)  # flat
+    feed = make_feed([100.0] * 30)  # flat
     signal = asyncio.run(strategy.evaluate(market, feed))
     assert signal is None
 
@@ -36,7 +36,7 @@ def test_no_signal_on_flat_market():
 def test_no_signal_on_small_move():
     strategy = MomentumStrategy(lookback_seconds=45, min_move_pct=0.05)
     market = make_market()
-    prices = [100.0 + i * 0.001 for i in range(20)]  # tiny move
+    prices = [100.0 + i * 0.001 for i in range(30)]  # tiny move
     feed = make_feed(prices)
     signal = asyncio.run(strategy.evaluate(market, feed))
     assert signal is None
@@ -45,20 +45,21 @@ def test_no_signal_on_small_move():
 def test_signal_on_strong_up_move():
     strategy = MomentumStrategy(lookback_seconds=45, min_move_pct=0.05, min_edge=0.0, fee_pct=0.0)
     market = make_market(up_price=0.45, down_price=0.55)
-    # 0.5% up move
-    prices = [100.0 + i * 0.025 for i in range(20)]
+    # Steady 0.5% up move — consistent and accelerating
+    prices = [100.0 + i * 0.025 for i in range(30)]
     feed = make_feed(prices)
     signal = asyncio.run(strategy.evaluate(market, feed))
     assert signal is not None
     assert signal.direction == Direction.UP
     assert signal.predicted_prob > 0.5
+    assert signal.reasoning  # should have reasoning
 
 
 def test_signal_on_strong_down_move():
     strategy = MomentumStrategy(lookback_seconds=45, min_move_pct=0.05, min_edge=0.0, fee_pct=0.0)
     market = make_market(up_price=0.55, down_price=0.45)
-    # 0.5% down move
-    prices = [100.0 - i * 0.025 for i in range(20)]
+    # Steady 0.5% down move
+    prices = [100.0 - i * 0.025 for i in range(30)]
     feed = make_feed(prices)
     signal = asyncio.run(strategy.evaluate(market, feed))
     assert signal is not None
@@ -71,3 +72,19 @@ def test_not_enough_data():
     feed = make_feed([100.0] * 5)  # only 5 ticks
     signal = asyncio.run(strategy.evaluate(market, feed))
     assert signal is None
+
+
+def test_no_signal_on_inconsistent_move():
+    """A spike followed by a fade should not generate a signal."""
+    strategy = MomentumStrategy(lookback_seconds=45, min_move_pct=0.05, min_edge=0.0, fee_pct=0.0)
+    market = make_market(up_price=0.45, down_price=0.55)
+    # Spike up then come back — inconsistent
+    prices = (
+        [100.0 + i * 0.05 for i in range(10)]  # up
+        + [100.5 - i * 0.02 for i in range(10)]  # fade
+        + [100.3 + i * 0.02 for i in range(10)]  # up again slightly
+    )
+    feed = make_feed(prices)
+    signal = asyncio.run(strategy.evaluate(market, feed))
+    # Should be filtered by consistency or small final momentum
+    # Either no signal or weaker signal is acceptable

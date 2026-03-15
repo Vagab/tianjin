@@ -97,21 +97,14 @@ class MomentumStrategy(Strategy):
 
         # --- VWAP DEVIATION (mean-reversion guard) ---
         vwap_dev = vwap_deviation(ticks)
-        # If price is extended in our direction, the move may revert
-        price_extended = (direction == Direction.UP and vwap_dev > 0.15) or (
-            direction == Direction.DOWN and vwap_dev < -0.15
-        )
-        # If price is against our direction but flow supports it = buying into weakness
-        buying_weakness = (direction == Direction.UP and vwap_dev < -0.05 and tfi_aligned) or (
-            direction == Direction.DOWN and vwap_dev > 0.05 and tfi_aligned
-        )
-
-        if price_extended:
-            # Dampen — move may be exhausted
+        # Price extended in our direction → mean reversion risk, dampen
+        if (direction == Direction.UP and vwap_dev > 0.2) or \
+           (direction == Direction.DOWN and vwap_dev < -0.2):
             predicted_prob = 0.5 + (predicted_prob - 0.5) * 0.7
-        elif buying_weakness:
-            # Extra confidence — flow supports despite price lag
-            predicted_prob = min(0.90, predicted_prob + 0.03)
+        # Price compressed against our direction → more room to run, slight boost
+        elif (direction == Direction.UP and vwap_dev < 0) or \
+             (direction == Direction.DOWN and vwap_dev > 0):
+            predicted_prob = 0.5 + (predicted_prob - 0.5) * 1.05
 
         # --- VOLATILITY DAMPENING ---
         vol = volatility(prices)
@@ -134,9 +127,9 @@ class MomentumStrategy(Strategy):
             return None
 
         # --- CONFIDENCE (from secondary signals) ---
-        rsi_val = rsi(prices)
-        rsi_confirms = (direction == Direction.UP and rsi_val > 55) or (
-            direction == Direction.DOWN and rsi_val < 45
+        rsi_val = rsi(prices, period=6)
+        rsi_confirms = (direction == Direction.UP and rsi_val > 58) or (
+            direction == Direction.DOWN and rsi_val < 42
         )
         accel = price_acceleration(prices)
         move_accelerating = (direction == Direction.UP and accel > 0) or (

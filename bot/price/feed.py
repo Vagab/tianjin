@@ -7,19 +7,12 @@ import json
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
 
 import websockets
 
+from bot.market.models import PriceTick  # canonical location; re-exported here for compat
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PriceTick:
-    price: float
-    timestamp: float
-    volume: float = 0.0
-    is_buyer_maker: bool = False  # True = seller aggressor, False = buyer aggressor
 
 
 class BtcPriceFeed:

@@ -6,7 +6,7 @@ import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from bot.price.feed import PriceTick
+    from bot.market.models import PriceTick
 
 
 def momentum(prices: list[float]) -> float:

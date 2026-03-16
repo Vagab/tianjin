@@ -19,8 +19,12 @@ class Settings(BaseSettings):
     polymarket_builder_secret: str = ""
     polymarket_builder_passphrase: str = ""
 
-    # Binance
+    # Binance (BTC price feed)
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+
+    # Polymarket WebSocket (fill confirmation)
+    polymarket_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws"
+    order_fill_timeout_seconds: int = 30
 
     # Telegram
     telegram_bot_token: str = ""
@@ -29,7 +33,7 @@ class Settings(BaseSettings):
     # Trading
     paper_trading: bool = False
     market_interval: Literal["5m", "15m"] = "5m"
-    order_type: str = "FOK"
+    order_type: str = "GTC"
 
     # Risk
     max_position_usd: float = 300.0
@@ -42,6 +46,7 @@ class Settings(BaseSettings):
     # Strategy
     momentum_lookback_seconds: int = 45
     momentum_min_move_pct: float = 0.05
+    max_entry_window_pct: float = 0.75
 
     @property
     def interval_seconds(self) -> int:

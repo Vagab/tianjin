@@ -63,6 +63,7 @@ class TradingBot:
                 builder_api_key=settings.polymarket_builder_api_key,
                 builder_secret=settings.polymarket_builder_secret,
                 builder_passphrase=settings.polymarket_builder_passphrase,
+                fill_timeout=float(settings.order_fill_timeout_seconds),
             )
             logger.info("Running in LIVE trading mode")
 
@@ -76,7 +77,7 @@ class TradingBot:
     async def start(self):
         self._running = True
 
-        # Start subsystems
+        # Start Binance BTC price feed
         await self.price_feed.start()
         await self.price_feed.wait_for_price()
         logger.info("BTC price feed active: $%.2f", self.price_feed.current_price)
@@ -219,14 +220,14 @@ class TradingBot:
                 await asyncio.sleep(remaining + 2)
             return
 
-        # Capture BTC price at window open — this is what the contract settles on
-        window_open_btc_price = self.price_feed.price_at(float(market.start_ts))
-        if window_open_btc_price is None:
-            window_open_btc_price = self.price_feed.current_price
+        # Capture BTC price at window open
+        window_open_price = self.price_feed.price_at(float(market.start_ts))
+        if window_open_price is None:
+            window_open_price = self.price_feed.current_price
 
         logger.info(
             "Market: %s | Up=%.3f Down=%.3f | BTC open=$%.2f",
-            market.slug, market.up_price, market.down_price, window_open_btc_price,
+            market.slug, market.up_price, market.down_price, window_open_price,
         )
 
         # Calculate time remaining in this window
@@ -235,22 +236,21 @@ class TradingBot:
         remaining = window_end - now
 
         if remaining < 30:
-            # Too close to end, wait for next window
             logger.info("Window ending in %.0fs, waiting for next...", remaining)
             await asyncio.sleep(remaining + 2)
             return
 
-        # 2. EVALUATE — check for signal every second during first 2 minutes
+        # 3. EVALUATE — check for signal, stop at max_entry_window_pct of window
         traded = False
-        trade_btc_price: float | None = None  # BTC price at time of trade
-        current_order_id: str | None = None  # track open order for cancel+replace
+        current_order_id: str | None = None
         current_direction: Direction | None = None
-        eval_duration = remaining - 5  # evaluate until 5s before window end (matches backtest)
-        eval_end = now + eval_duration
+        window_duration = market.end_ts - market.start_ts
+        max_eval_ts = market.start_ts + (window_duration * settings.max_entry_window_pct)
+        eval_end = min(max_eval_ts, window_end - 5)
 
         last_refresh = 0.0
         while time.time() < eval_end and self._running and not traded:
-            # Refresh market prices every 15 seconds (not every tick)
+            # Refresh market prices every 15 seconds
             now_t = time.time()
             if now_t - last_refresh > 15:
                 fresh_market = await self.discovery.get_current_market()
@@ -258,7 +258,7 @@ class TradingBot:
                     market = fresh_market
                 last_refresh = now_t
 
-            signal = await self.strategy.evaluate(market, self.price_feed, window_open_btc_price)
+            signal = await self.strategy.evaluate(market, self.price_feed, window_open_price)
 
             if signal and signal.is_actionable:
                 # If we have an open order in the opposite direction, cancel it first
@@ -277,12 +277,12 @@ class TradingBot:
                     await asyncio.sleep(1)
                     continue
 
-                # 3. RISK CHECK
+                # 4. RISK CHECK
                 portfolio = self.executor.portfolio
                 risk_check = self.risk.check(signal, portfolio)
 
                 if risk_check.allowed:
-                    # 4. EXECUTE
+                    # 5. EXECUTE
                     result = await self.executor.execute(
                         market, signal.direction, risk_check.position_size,
                         edge=signal.edge,
@@ -293,16 +293,15 @@ class TradingBot:
                         self._mark_traded(market.slug)
                         current_order_id = result.order_id
                         current_direction = signal.direction
-                        trade_btc_price = self.price_feed.current_price
                         # Sync balance and PnL from Polymarket
                         await self.executor.get_balance()
                         self._sync_pnl()
                         logger.info(
-                            "Trade executed: %s $%.2f | edge=%.3f | BTC=$%.2f",
+                            "Trade executed: %s $%.2f | edge=%.3f | fill_price=%.4f",
                             signal.direction.value,
                             risk_check.position_size,
                             signal.edge,
-                            trade_btc_price,
+                            result.fill_price or 0,
                         )
                         await self.telegram.notify_trade(
                             direction=signal.direction.value,
@@ -312,8 +311,6 @@ class TradingBot:
                             reasoning=signal.reasoning,
                         )
                     else:
-                        # Order might have gone through despite exception.
-                        # Track it so we don't place a contradicting order.
                         current_order_id = result.order_id or "unknown"
                         current_direction = signal.direction
                         logger.warning("Order failed: %s — won't retry this direction", result.error)
@@ -322,54 +319,44 @@ class TradingBot:
 
             await asyncio.sleep(1)
 
-        # 5. WAIT for window to end
+        # 6. WAIT for window to end
         remaining = market.end_ts - time.time()
         if remaining > 0:
             logger.info("Waiting %.0fs for window to close...", remaining)
-            await asyncio.sleep(remaining + 5)  # extra 5s for settlement
+            await asyncio.sleep(remaining)
 
-        # 6. SETTLE — check outcome
+        # 7. SETTLE — queue for background Gamma API resolution (non-blocking)
         if traded:
-            await self._settle(market, window_open_btc_price)
-
-    async def _settle(self, market: Market, window_open_price: float | None):
-        """Queue market for background settlement (non-blocking)."""
-        self._pending_settlements.append({
-            "market": market,
-            "window_open_price": window_open_price,
-            "queued_at": time.time(),
-        })
-        logger.info("Queued for settlement: %s", market.slug)
+            logger.info("Queued for settlement: %s", market.slug)
+            self._pending_settlements.append({
+                "market": market,
+                "queued_at": time.time(),
+            })
 
     async def _background_settle(self):
-        """Background task: resolve queued markets via Polymarket API."""
+        """Background task: resolve queued markets via Gamma API + periodic redemption."""
+        redeem_counter = 0
         while self._running:
             try:
                 await asyncio.sleep(30)
+                redeem_counter += 1
 
+                # 1. Resolve pending settlements via Gamma API
                 still_pending = []
                 for item in self._pending_settlements:
                     market = item["market"]
-                    window_open_price = item["window_open_price"]
                     age = time.time() - item["queued_at"]
 
                     try:
                         resolved = await self.discovery.get_resolved_outcome(market.slug)
                         if resolved:
                             winning = Direction.UP if resolved.lower() == "up" else Direction.DOWN
-                            logger.info("Settlement: %s resolved %s (via Polymarket, %.0fs after close)",
+                            logger.info("Settlement via Gamma API: %s resolved %s (%.0fs after close)",
                                         market.slug, winning.value, age)
-                            await self._finalize_settlement(market, winning)
+                            self.executor.settle_position(market.slug, winning_direction=winning)
+                            await self._post_settlement(market)
                         elif age > 600:
-                            # Fallback to Binance after 10 minutes
-                            end_price = self.price_feed.current_price
-                            if window_open_price and end_price > 0:
-                                winning = Direction.UP if end_price >= window_open_price else Direction.DOWN
-                                logger.warning("Binance fallback (10min timeout): %s = %s",
-                                               market.slug, winning.value)
-                                await self._finalize_settlement(market, winning)
-                            else:
-                                logger.error("Cannot settle %s — no price data, dropping", market.slug)
+                            logger.error("Cannot settle %s after 10min — dropping", market.slug)
                         else:
                             still_pending.append(item)
                     except Exception as e:
@@ -381,17 +368,26 @@ class TradingBot:
 
                 self._pending_settlements = still_pending
 
+                # 2. Periodic redemption sweep — every 5 min, redeem any unclaimed wins
+                if redeem_counter % 10 == 0 and hasattr(self.executor, "redeem_all"):
+                    try:
+                        results = self.executor.redeem_all()
+                        if results:
+                            logger.info("Periodic redeem: claimed %d position(s)", len(results))
+                            await self.executor.get_balance()
+                            self._sync_pnl()
+                    except Exception as e:
+                        logger.error("Periodic redeem error: %s", e)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Background settle error: %s", e)
                 await asyncio.sleep(10)
 
-    async def _finalize_settlement(self, market: Market, winning: Direction):
-        """Finalize a resolved settlement: update trades, redeem, notify."""
+    async def _post_settlement(self, market: Market):
+        """Post-settlement: redeem, update PnL, notify."""
         try:
-            self.executor.settle_position(market.slug, winning)
-
             # Redeem all winning positions via gasless relayer
             if hasattr(self.executor, "redeem_all"):
                 results = self.executor.redeem_all()
@@ -410,8 +406,11 @@ class TradingBot:
             self.risk.record_outcome(won)
 
             # Notify via Telegram and log
+            matched = False
             for trade in reversed(self.executor.portfolio.trades):
                 if trade.market_slug == market.slug and trade.outcome:
+                    matched = True
+                    logger.info("Notifying outcome: %s %s PnL=$%.2f", market.slug, trade.outcome, trade.pnl)
                     await self.telegram.notify_outcome(
                         market=market.slug,
                         outcome=trade.outcome,
@@ -420,10 +419,13 @@ class TradingBot:
                     )
                     self.metrics.log_trade(trade)
                     break
+            if not matched:
+                logger.warning("No trade found for %s in %d trades", market.slug,
+                               len(self.executor.portfolio.trades))
 
             logger.info("Summary: %s", self.metrics.summary(self.executor.portfolio))
         except Exception as e:
-            logger.error("Finalize settlement error for %s: %s", market.slug, e)
+            logger.error("Post-settlement error for %s: %s", market.slug, e)
 
 
 def main():

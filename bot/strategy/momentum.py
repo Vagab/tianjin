@@ -16,7 +16,6 @@ import math
 import time
 
 from bot.market.models import Direction, Market
-from bot.price.feed import BtcPriceFeed
 from bot.price.indicators import (
     ema,
     momentum,
@@ -40,13 +39,17 @@ class MomentumStrategy(Strategy):
         min_move_pct: float = 0.05,
         fee_pct: float = 0.02,
         min_edge: float = 0.03,
+        base_k: float = 200.0,
+        vwap_kill: float = 0.08,
     ):
         self.lookback_seconds = lookback_seconds
         self.min_move_pct = min_move_pct
         self.fee_pct = fee_pct
         self.min_edge = min_edge
+        self.base_k = base_k
+        self.vwap_kill = vwap_kill
 
-    async def evaluate(self, market: Market, price_feed: BtcPriceFeed, window_open_price: float | None = None) -> Signal | None:
+    async def evaluate(self, market: Market, price_feed, window_open_price: float | None = None) -> Signal | None:
         prices = price_feed.prices_since(self.lookback_seconds)
         ticks = price_feed.ticks_since(self.lookback_seconds)
 
@@ -77,11 +80,10 @@ class MomentumStrategy(Strategy):
 
         # --- BASE PROBABILITY (volatility-adaptive k) ---
         vol = volatility(prices)
-        base_k = 200.0
         if vol > 0:
-            k = base_k * min(2.0, max(0.5, 0.0003 / vol))
+            k = self.base_k * min(2.0, max(0.5, 0.0003 / vol))
         else:
-            k = base_k
+            k = self.base_k
         predicted_prob = 1 / (1 + math.exp(-k * abs(window_mom) / 100))
 
         # --- ROLLING MOMENTUM CONFIRMATION ---
@@ -118,8 +120,8 @@ class MomentumStrategy(Strategy):
 
         # --- VWAP DEVIATION (hard guard) ---
         vwap_dev = vwap_deviation(ticks)
-        vwap_extended = (direction == Direction.UP and vwap_dev > 0.08) or \
-                        (direction == Direction.DOWN and vwap_dev < -0.08)
+        vwap_extended = (direction == Direction.UP and vwap_dev > self.vwap_kill) or \
+                        (direction == Direction.DOWN and vwap_dev < -self.vwap_kill)
         if vwap_extended:
             return None
 

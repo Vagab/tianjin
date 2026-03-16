@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+@dataclass
+class PriceTick:
+    price: float
+    timestamp: float
+    volume: float = 0.0
+    is_buyer_maker: bool = False  # True = seller aggressor, False = buyer aggressor
+
+
 class Direction(str, Enum):
     UP = "UP"
     DOWN = "DOWN"

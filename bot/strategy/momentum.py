@@ -116,8 +116,12 @@ class MomentumStrategy(Strategy):
         elif accel_opposing and abs(accel) > 0.02:
             return None
 
-        # --- VWAP DEVIATION (for reasoning only) ---
+        # --- VWAP DEVIATION (hard guard) ---
         vwap_dev = vwap_deviation(ticks)
+        vwap_extended = (direction == Direction.UP and vwap_dev > 0.08) or \
+                        (direction == Direction.DOWN and vwap_dev < -0.08)
+        if vwap_extended:
+            return None
 
         # Clamp
         predicted_prob = max(0.50, min(0.97, predicted_prob))

@@ -59,6 +59,10 @@ class TradingBot:
                 private_key=pk,
                 chain_id=settings.polymarket_chain_id,
                 funder=settings.polymarket_funder,
+                rpc_url=settings.polygon_rpc_url,
+                builder_api_key=settings.polymarket_builder_api_key,
+                builder_secret=settings.polymarket_builder_secret,
+                builder_passphrase=settings.polymarket_builder_passphrase,
             )
             logger.info("Running in LIVE trading mode")
 
@@ -236,7 +240,7 @@ class TradingBot:
         trade_btc_price: float | None = None  # BTC price at time of trade
         current_order_id: str | None = None  # track open order for cancel+replace
         current_direction: Direction | None = None
-        eval_duration = min(120, remaining - 30)  # stop 30s before end
+        eval_duration = remaining - 5  # evaluate until 5s before window end (matches backtest)
         eval_end = now + eval_duration
 
         last_refresh = 0.0
@@ -326,25 +330,47 @@ class TradingBot:
     async def _settle(self, market: Market, window_open_price: float | None):
         """Check outcome and settle position."""
         try:
-            # Determine winner: compare BTC price at window open vs window close
-            # This matches how Polymarket settles the binary contract
-            end_price = self.price_feed.current_price
+            # Ask Polymarket for the resolved outcome (Chainlink oracle)
+            # Retry a few times since resolution can take a couple minutes
+            winning = None
+            for attempt in range(4):
+                resolved = await self.discovery.get_resolved_outcome(market.slug)
+                if resolved:
+                    winning = Direction.UP if resolved.lower() == "up" else Direction.DOWN
+                    break
+                if attempt < 3:
+                    logger.info("Market %s not resolved yet, retrying in 30s... (attempt %d/4)", market.slug, attempt + 1)
+                    await asyncio.sleep(30)
 
-            if window_open_price is None or end_price == 0:
-                window_open_price = self.price_feed.price_at(float(market.start_ts))
-                if window_open_price is None:
-                    logger.error("Cannot determine outcome — no price data")
-                    return
+            # Fallback to Binance price comparison if API doesn't return outcome
+            if winning is None:
+                end_price = self.price_feed.current_price
+                if window_open_price is None or end_price == 0:
+                    window_open_price = self.price_feed.price_at(float(market.start_ts))
+                    if window_open_price is None:
+                        logger.error("Cannot determine outcome — no price data")
+                        return
+                winning = Direction.UP if end_price >= window_open_price else Direction.DOWN
+                logger.warning("Using Binance fallback for settlement: $%.2f -> $%.2f = %s",
+                               window_open_price, end_price, winning.value)
+            else:
+                logger.info("Settlement: %s resolved %s (via Polymarket)", market.slug, winning.value)
 
-            winning = Direction.UP if end_price >= window_open_price else Direction.DOWN
-
-            logger.info(
-                "Settlement: BTC $%.2f (open) -> $%.2f (close) = %s",
-                window_open_price, end_price, winning.value,
-            )
+            # Find our token_id before settling (settle removes the position)
+            our_token_id = None
+            for pos in self.executor.portfolio.open_positions:
+                if pos.market_slug == market.slug:
+                    our_token_id = pos.token_id
+                    break
 
             # Settle via executor (works for both paper and live)
             self.executor.settle_position(market.slug, winning)
+
+            # Redeem all winning positions via gasless relayer
+            if hasattr(self.executor, "redeem_all"):
+                results = self.executor.redeem_all()
+                if results:
+                    logger.info("Redeemed %d position(s) via relayer", len(results))
 
             # Always refresh balance and PnL from Polymarket
             await self.executor.get_balance()

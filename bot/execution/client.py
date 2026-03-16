@@ -8,13 +8,24 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BalanceAllowanceParams, OrderArgs, OrderType
 
 from bot.execution.paper import Executor, OrderResult
+from bot.execution.redeemer import Redeemer
 from bot.market.models import Direction, Market, PortfolioState, Position, TradeRecord
 
 logger = logging.getLogger(__name__)
 
 
 class LiveExecutor(Executor):
-    def __init__(self, host: str, private_key: str, chain_id: int = 137, funder: str = ""):
+    def __init__(
+        self,
+        host: str,
+        private_key: str,
+        chain_id: int = 137,
+        funder: str = "",
+        rpc_url: str = "",
+        builder_api_key: str = "",
+        builder_secret: str = "",
+        builder_passphrase: str = "",
+    ):
         self._is_proxy = bool(funder)
         kwargs = {
             "host": host,
@@ -28,6 +39,21 @@ class LiveExecutor(Executor):
         self._client = ClobClient(**kwargs)
         self._init_creds()
         self.portfolio = PortfolioState()
+
+        # Gasless redeemer via Polymarket relayer
+        self._redeemer = None
+        if builder_api_key and builder_secret and builder_passphrase:
+            try:
+                self._redeemer = Redeemer(
+                    private_key=private_key,
+                    funder=funder,
+                    builder_api_key=builder_api_key,
+                    builder_secret=builder_secret,
+                    builder_passphrase=builder_passphrase,
+                )
+                logger.info("Redeemer initialized (gasless via relayer)")
+            except Exception as e:
+                logger.warning("Failed to init redeemer: %s", e)
 
     def _init_creds(self):
         creds = self._client.create_or_derive_api_creds()
@@ -162,6 +188,12 @@ class LiveExecutor(Executor):
             )
 
         self.portfolio.open_positions = remaining
+
+    def redeem_all(self) -> list[dict]:
+        """Redeem all winning positions via gasless relayer."""
+        if not self._redeemer:
+            return []
+        return self._redeemer.redeem_all()
 
     async def get_market_price(self, market: Market, direction: Direction) -> float:
         token_id = (

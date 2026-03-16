@@ -109,6 +109,45 @@ def trade_flow_imbalance(ticks: list[PriceTick]) -> float:
     return (buy_vol - sell_vol) / total
 
 
+def price_slope(prices: list[float]) -> float:
+    """Linear regression slope of prices, normalized as % per sample.
+
+    More robust than simple start-to-end momentum — resistant to end-point noise.
+    """
+    n = len(prices)
+    if n < 3:
+        return 0.0
+    mean_x = (n - 1) / 2
+    mean_y = sum(prices) / n
+    num = sum((i - mean_x) * (p - mean_y) for i, p in enumerate(prices))
+    den = sum((i - mean_x) ** 2 for i in range(n))
+    if den == 0 or mean_y == 0:
+        return 0.0
+    slope = num / den
+    return slope / mean_y * 100  # as percentage
+
+
+def tick_intensity(ticks: list[PriceTick], seconds: float = 10) -> float:
+    """Ratio of recent tick rate to overall tick rate.
+
+    > 1.0 means activity is accelerating recently.
+    """
+    if len(ticks) < 10:
+        return 1.0
+    total_span = ticks[-1].timestamp - ticks[0].timestamp
+    if total_span <= 0:
+        return 1.0
+
+    cutoff = ticks[-1].timestamp - seconds
+    recent = [t for t in ticks if t.timestamp >= cutoff]
+    recent_span = seconds
+
+    overall_rate = len(ticks) / total_span
+    recent_rate = len(recent) / recent_span if recent_span > 0 else 0
+
+    return recent_rate / overall_rate if overall_rate > 0 else 1.0
+
+
 def vwap(ticks: list[PriceTick]) -> float:
     """Volume-Weighted Average Price."""
     if not ticks:

@@ -143,6 +143,40 @@ class MarketDiscovery:
             end_ts=window_ts + self.interval_seconds,
         )
 
+    async def get_resolved_outcome(self, slug: str) -> str | None:
+        """Fetch the resolved outcome ("Up" or "Down") from Gamma API.
+
+        Returns None if the market hasn't resolved yet.
+        """
+        try:
+            resp = await self._client.get(
+                f"{GAMMA_API}/events", params={"slug": slug}
+            )
+            resp.raise_for_status()
+            events = resp.json()
+            if not events:
+                return None
+
+            markets = events[0].get("markets", [])
+            if not markets:
+                return None
+
+            m = markets[0]
+            prices = json.loads(m.get("outcomePrices", "[]"))
+            outcomes = m.get("outcomes", '["Up", "Down"]')
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+
+            for i, outcome in enumerate(outcomes):
+                price = float(prices[i]) if i < len(prices) else 0.0
+                if price == 1.0:
+                    return outcome  # "Up" or "Down"
+
+            return None  # not resolved yet (prices still between 0-1)
+        except Exception as e:
+            logger.warning("Failed to fetch resolved outcome for %s: %s", slug, e)
+            return None
+
     async def close(self):
         await self._client.aclose()
 

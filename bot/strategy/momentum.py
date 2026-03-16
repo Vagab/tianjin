@@ -1,14 +1,12 @@
-"""V3 Momentum + Order Flow Strategy.
+"""V5 Momentum + Order Flow Strategy.
 
 Signal flow:
-1. Momentum magnitude check (hard gate)
-2. Logistic with k=200 → base predicted_prob
-3. Consistency → soft dampener on predicted_prob
-4. TFI (Trade Flow Imbalance) → boost or dampen/kill
-5. VWAP deviation → mean-reversion guard
-6. Volatility dampening
-7. RSI + acceleration → minor confidence adjustments
-8. Edge check against market price + fees
+1. Window-anchored momentum (BTC vs window open price)
+2. Time-adaptive minimum move gate (stricter early, relaxed late)
+3. Volatility-adaptive logistic k → base predicted_prob
+4. TFI boost (aligned flow → up to +20%)
+5. Acceleration boost/kill (+8% boost or kill on strong decel)
+6. Edge check: predicted_prob - market_prob - fees >= 0.03
 """
 
 from __future__ import annotations
@@ -56,27 +54,29 @@ class MomentumStrategy(Strategy):
             return None
 
         # --- PRIMARY SIGNAL: window-anchored momentum ---
-        # The contract settles on: is BTC above or below the window open price?
-        # This directly predicts the settlement outcome.
         current_price = price_feed.current_price
-        rolling_mom = momentum(prices)  # 45s rolling (used as confirmation)
+        rolling_mom = momentum(prices)
 
         if window_open_price and window_open_price > 0:
             window_mom = (current_price - window_open_price) / window_open_price * 100
         else:
-            window_mom = rolling_mom  # fallback
+            window_mom = rolling_mom
 
-        # --- HARD GATE: minimum move ---
-        if abs(window_mom) < self.min_move_pct:
+        # --- WINDOW TIME WEIGHTING ---
+        now_ts = ticks[-1].timestamp if ticks else time.time()
+        elapsed = now_ts - market.start_ts
+        window_duration = max(1, market.end_ts - market.start_ts)
+        time_weight = min(1.0, max(0.0, elapsed / window_duration))
+
+        # --- HARD GATE: time-adaptive minimum move ---
+        adaptive_min = self.min_move_pct * (1.85 - time_weight)
+        if abs(window_mom) < adaptive_min:
             return None
 
         direction = Direction.UP if window_mom > 0 else Direction.DOWN
 
         # --- BASE PROBABILITY (volatility-adaptive k) ---
         vol = volatility(prices)
-        # In low-vol regimes, a small move is more meaningful → higher k
-        # In high-vol regimes, a move could be noise → lower k
-        # Base k=200 at vol=0.0003, scales inversely
         base_k = 200.0
         if vol > 0:
             k = base_k * min(2.0, max(0.5, 0.0003 / vol))
@@ -84,41 +84,15 @@ class MomentumStrategy(Strategy):
             k = base_k
         predicted_prob = 1 / (1 + math.exp(-k * abs(window_mom) / 100))
 
-        # --- WINDOW TIME WEIGHTING ---
-        # Use latest tick timestamp for backtest compatibility
-        now_ts = ticks[-1].timestamp if ticks else time.time()
-        elapsed = now_ts - market.start_ts
-        window_duration = max(1, market.end_ts - market.start_ts)
-        time_weight = min(1.0, max(0.0, elapsed / window_duration))
-
-        # Early in window → dampen edge (move not yet established)
-        # Late in window → full weight (move has persisted)
-        predicted_prob = 0.5 + (predicted_prob - 0.5) * (0.5 + 0.5 * time_weight)
-
         # --- ROLLING MOMENTUM CONFIRMATION ---
-        # If recent 45s trend opposes the window-level direction, dampen
-        rolling_threshold = 0.05  # fixed threshold, decoupled from min_move_pct
+        rolling_threshold = 0.05
         rolling_opposes = (direction == Direction.UP and rolling_mom < -rolling_threshold) or \
                           (direction == Direction.DOWN and rolling_mom > rolling_threshold)
-        if rolling_opposes:
-            predicted_prob = 0.5 + (predicted_prob - 0.5) * 0.6
 
-        # --- EMA TREND FILTER ---
-        # Fast EMA vs slow EMA — if they disagree with direction, dampen
-        if len(prices) >= 15:
-            fast_ema = ema(prices, period=5)
-            slow_ema = ema(prices, period=15)
-            ema_trend_up = fast_ema > slow_ema
-            if (direction == Direction.UP and not ema_trend_up) or \
-               (direction == Direction.DOWN and ema_trend_up):
-                predicted_prob = 0.5 + (predicted_prob - 0.5) * 0.5
-
-        # --- CONSISTENCY (soft dampener, not hard gate) ---
+        # --- CONSISTENCY (for confidence only, no dampening) ---
         consistency = momentum_consistency(prices, segments=3)
-        # Scale: 0.33 → dampen to 33% of edge, 0.67 → 67%, 1.0 → full
-        predicted_prob = 0.5 + (predicted_prob - 0.5) * max(0.33, consistency)
 
-        # --- TFI: Trade Flow Imbalance (primary confirmation) ---
+        # --- TFI: Trade Flow Imbalance ---
         tfi = trade_flow_imbalance(ticks)
         tfi_aligned = (direction == Direction.UP and tfi > 0) or (
             direction == Direction.DOWN and tfi < 0
@@ -127,32 +101,26 @@ class MomentumStrategy(Strategy):
             direction == Direction.DOWN and tfi > 0.2
         )
 
-        # TFI opposing → dampen instead of kill (to allow more trades)
-        if tfi_opposing:
-            predicted_prob = 0.5 + (predicted_prob - 0.5) * 0.5
-        elif tfi_aligned:
-            tfi_boost = min(0.08, abs(tfi) * 0.1)  # max +8% boost
+        if tfi_aligned:
+            tfi_boost = min(0.20, abs(tfi) * 0.25)
             predicted_prob += tfi_boost
 
-
         # --- ACCELERATION BOOST ---
-        # If the move is accelerating (2nd half faster than 1st), it's more likely to persist
         accel = price_acceleration(prices)
         accel_aligned = (direction == Direction.UP and accel > 0) or \
                         (direction == Direction.DOWN and accel < 0)
         accel_opposing = (direction == Direction.UP and accel < -0.02) or \
                          (direction == Direction.DOWN and accel > 0.02)
         if accel_aligned:
-            predicted_prob += min(0.04, abs(accel) * 0.02)
-        elif accel_opposing and abs(accel) > 0.03:
-            # Strong deceleration = move is fading, kill
+            predicted_prob += min(0.08, abs(accel) * 0.04)
+        elif accel_opposing and abs(accel) > 0.02:
             return None
 
         # --- VWAP DEVIATION (for reasoning only) ---
         vwap_dev = vwap_deviation(ticks)
 
         # Clamp
-        predicted_prob = max(0.50, min(0.95, predicted_prob))
+        predicted_prob = max(0.50, min(0.97, predicted_prob))
 
         # --- EDGE CHECK ---
         market_prob = market.up_price if direction == Direction.UP else market.down_price
@@ -196,7 +164,7 @@ class MomentumStrategy(Strategy):
 
         rolling_label = f"recent {rolling_mom:+.3f}%/{self.lookback_seconds}s"
         if rolling_opposes:
-            rolling_label += " (opposing, dampened)"
+            rolling_label += " (opposing)"
 
         reasoning = (
             f"Pred {predicted_prob:.0%} {direction.value} vs market {market_prob:.0%} "

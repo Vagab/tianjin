@@ -28,7 +28,7 @@ class RiskManager:
         kelly_fraction: float = 0.25,
         min_edge: float = 0.03,
         cooldown_seconds: float = 30.0,
-        max_consecutive_losses: int = 5,
+        max_consecutive_losses: int = 8,
     ):
         self.max_position_usd = max_position_usd
         self.max_exposure_usd = max_exposure_usd
@@ -112,6 +112,7 @@ class RiskManager:
 
     def reset_daily(self):
         self._halted = False
+        self._consecutive_losses = 0
 
     def force_halt(self):
         self._halted = True

@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     polymarket_private_key: SecretStr = SecretStr("")
     polymarket_chain_id: int = 137
     polymarket_funder: str = ""
+    polygon_rpc_url: str = "https://polygon-bor-rpc.publicnode.com"
+
+    # Builder API (for gasless redemption via relayer)
+    polymarket_builder_api_key: str = ""
+    polymarket_builder_secret: str = ""
+    polymarket_builder_passphrase: str = ""
 
     # Binance
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
@@ -26,8 +32,8 @@ class Settings(BaseSettings):
     order_type: str = "FOK"
 
     # Risk
-    max_position_usd: float = 100.0
-    max_exposure_usd: float = 500.0
+    max_position_usd: float = 300.0
+    max_exposure_usd: float = 1000.0
     max_daily_loss_usd: float = 200.0
     kelly_fraction: float = 0.60
     min_edge: float = 0.03

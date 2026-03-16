@@ -33,6 +33,7 @@ class TradingBot:
             min_move_pct=settings.momentum_min_move_pct,
             fee_pct=settings.estimated_taker_fee_pct,
             min_edge=settings.min_edge,
+            htf_filter=settings.htf_filter,
         )
         self.risk = RiskManager(
             max_position_usd=settings.max_position_usd,

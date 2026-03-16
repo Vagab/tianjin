@@ -21,6 +21,7 @@ from bot.price.indicators import (
     momentum,
     momentum_consistency,
     price_acceleration,
+    price_slope,
     rsi,
     trade_flow_imbalance,
     volatility,
@@ -41,6 +42,7 @@ class MomentumStrategy(Strategy):
         min_edge: float = 0.03,
         base_k: float = 200.0,
         vwap_kill: float = 0.08,
+        htf_filter: bool = False,
     ):
         self.lookback_seconds = lookback_seconds
         self.min_move_pct = min_move_pct
@@ -48,6 +50,7 @@ class MomentumStrategy(Strategy):
         self.min_edge = min_edge
         self.base_k = base_k
         self.vwap_kill = vwap_kill
+        self.htf_filter = htf_filter
 
     async def evaluate(self, market: Market, price_feed, window_open_price: float | None = None) -> Signal | None:
         prices = price_feed.prices_since(self.lookback_seconds)
@@ -77,6 +80,41 @@ class MomentumStrategy(Strategy):
             return None
 
         direction = Direction.UP if window_mom > 0 else Direction.DOWN
+
+        # --- HIGHER TIMEFRAME REGIME FILTER ---
+        # Uses linear regression slope on 15m and 60m of price data to detect
+        # trend regime. Blocks trades that fight a strong opposing trend.
+        # Also detects choppy regimes (conflicting slopes) and requires higher edge.
+        if self.htf_filter:
+            htf_prices_15m = price_feed.prices_since(900)   # 15 minutes
+            htf_prices_60m = price_feed.prices_since(3600)  # 1 hour
+
+            # Downsample to keep regression fast (~100 points max)
+            if len(htf_prices_15m) > 100:
+                step = len(htf_prices_15m) // 100
+                htf_prices_15m = htf_prices_15m[::step]
+            if len(htf_prices_60m) > 100:
+                step = len(htf_prices_60m) // 100
+                htf_prices_60m = htf_prices_60m[::step]
+
+            htf_slope_15m = price_slope(htf_prices_15m) if len(htf_prices_15m) > 30 else 0.0
+            htf_slope_60m = price_slope(htf_prices_60m) if len(htf_prices_60m) > 60 else 0.0
+
+            # Strong opposing trend: 15m slope clearly against our direction
+            htf_opposing = (direction == Direction.UP and htf_slope_15m < -0.003) or \
+                           (direction == Direction.DOWN and htf_slope_15m > 0.003)
+
+            # 60m confirms the opposing signal
+            htf_60m_opposing = (direction == Direction.UP and htf_slope_60m < -0.001) or \
+                               (direction == Direction.DOWN and htf_slope_60m > 0.001)
+
+            if htf_opposing and htf_60m_opposing:
+                # Both timeframes say we're fighting the trend — hard block
+                logger.debug(
+                    "HTF filter blocked %s: slope_15m=%.5f slope_60m=%.5f",
+                    direction.value, htf_slope_15m, htf_slope_60m,
+                )
+                return None
 
         # --- BASE PROBABILITY (volatility-adaptive k) ---
         vol = volatility(prices)

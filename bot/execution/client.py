@@ -108,12 +108,16 @@ class LiveExecutor(Executor):
 
         try:
             base_price = market.up_price if direction == Direction.UP else market.down_price
-            price = min(round(base_price + 0.02, 2), 0.99)
+            # Tiny premium to cross the spread and get filled.
+            # +$0.01 = 2% of $0.50 contract (vs old +$0.02 = 4%).
+            price = min(round(base_price + 0.01, 2), 0.99)
             size = round(amount_usd / price, 2)
 
             if size < 5:
-                size = 5.0
-                amount_usd = size * price
+                # Don't force minimum size — skip trade if Kelly says too small
+                logger.info("Size %.2f < 5 minimum, skipping (amount=$%.2f price=%.4f)",
+                            size, amount_usd, price)
+                return OrderResult(success=False, error="Position size below minimum")
 
             order_args = OrderArgs(
                 token_id=token_id,

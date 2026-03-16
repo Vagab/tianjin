@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     momentum_lookback_seconds: int = 45
     momentum_min_move_pct: float = 0.05
     max_entry_window_pct: float = 0.75
+    htf_filter: bool = True
 
     @property
     def interval_seconds(self) -> int:

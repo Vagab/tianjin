@@ -68,6 +68,7 @@ class TradingBot:
 
         self._running = False
         self._last_daily_reset: float = 0
+        self._pending_settlements: list[dict] = []  # queued for background resolution
         self._state_file = Path(__file__).resolve().parent.parent / "bot_state.json"
         self._traded_file = Path(__file__).resolve().parent.parent / "traded_markets.json"
         self._traded_markets: set[str] = self._load_traded_markets()
@@ -97,12 +98,16 @@ class TradingBot:
         self._load_or_init_state(balance)
         logger.info("Starting balance: $%.2f (initial: $%.2f)", balance, self._initial_balance)
 
+        # Start background settlement resolver
+        self._settle_task = asyncio.create_task(self._background_settle())
+
         # Main loop
         try:
             await self._run_loop()
         except asyncio.CancelledError:
             logger.info("Bot cancelled")
         finally:
+            self._settle_task.cancel()
             await self._shutdown()
 
     def stop(self):
@@ -328,42 +333,63 @@ class TradingBot:
             await self._settle(market, window_open_btc_price)
 
     async def _settle(self, market: Market, window_open_price: float | None):
-        """Check outcome and settle position."""
+        """Queue market for background settlement (non-blocking)."""
+        self._pending_settlements.append({
+            "market": market,
+            "window_open_price": window_open_price,
+            "queued_at": time.time(),
+        })
+        logger.info("Queued for settlement: %s", market.slug)
+
+    async def _background_settle(self):
+        """Background task: resolve queued markets via Polymarket API."""
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+
+                still_pending = []
+                for item in self._pending_settlements:
+                    market = item["market"]
+                    window_open_price = item["window_open_price"]
+                    age = time.time() - item["queued_at"]
+
+                    try:
+                        resolved = await self.discovery.get_resolved_outcome(market.slug)
+                        if resolved:
+                            winning = Direction.UP if resolved.lower() == "up" else Direction.DOWN
+                            logger.info("Settlement: %s resolved %s (via Polymarket, %.0fs after close)",
+                                        market.slug, winning.value, age)
+                            await self._finalize_settlement(market, winning)
+                        elif age > 600:
+                            # Fallback to Binance after 10 minutes
+                            end_price = self.price_feed.current_price
+                            if window_open_price and end_price > 0:
+                                winning = Direction.UP if end_price >= window_open_price else Direction.DOWN
+                                logger.warning("Binance fallback (10min timeout): %s = %s",
+                                               market.slug, winning.value)
+                                await self._finalize_settlement(market, winning)
+                            else:
+                                logger.error("Cannot settle %s — no price data, dropping", market.slug)
+                        else:
+                            still_pending.append(item)
+                    except Exception as e:
+                        logger.error("Settlement check error for %s: %s", market.slug, e)
+                        if age > 600:
+                            logger.error("Dropping %s after 10min of errors", market.slug)
+                        else:
+                            still_pending.append(item)
+
+                self._pending_settlements = still_pending
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Background settle error: %s", e)
+                await asyncio.sleep(10)
+
+    async def _finalize_settlement(self, market: Market, winning: Direction):
+        """Finalize a resolved settlement: update trades, redeem, notify."""
         try:
-            # Ask Polymarket for the resolved outcome (Chainlink oracle)
-            # Retry a few times since resolution can take a couple minutes
-            winning = None
-            for attempt in range(4):
-                resolved = await self.discovery.get_resolved_outcome(market.slug)
-                if resolved:
-                    winning = Direction.UP if resolved.lower() == "up" else Direction.DOWN
-                    break
-                if attempt < 3:
-                    logger.info("Market %s not resolved yet, retrying in 30s... (attempt %d/4)", market.slug, attempt + 1)
-                    await asyncio.sleep(30)
-
-            # Fallback to Binance price comparison if API doesn't return outcome
-            if winning is None:
-                end_price = self.price_feed.current_price
-                if window_open_price is None or end_price == 0:
-                    window_open_price = self.price_feed.price_at(float(market.start_ts))
-                    if window_open_price is None:
-                        logger.error("Cannot determine outcome — no price data")
-                        return
-                winning = Direction.UP if end_price >= window_open_price else Direction.DOWN
-                logger.warning("Using Binance fallback for settlement: $%.2f -> $%.2f = %s",
-                               window_open_price, end_price, winning.value)
-            else:
-                logger.info("Settlement: %s resolved %s (via Polymarket)", market.slug, winning.value)
-
-            # Find our token_id before settling (settle removes the position)
-            our_token_id = None
-            for pos in self.executor.portfolio.open_positions:
-                if pos.market_slug == market.slug:
-                    our_token_id = pos.token_id
-                    break
-
-            # Settle via executor (works for both paper and live)
             self.executor.settle_position(market.slug, winning)
 
             # Redeem all winning positions via gasless relayer
@@ -372,7 +398,6 @@ class TradingBot:
                 if results:
                     logger.info("Redeemed %d position(s) via relayer", len(results))
 
-            # Always refresh balance and PnL from Polymarket
             await self.executor.get_balance()
             self._sync_pnl()
 
@@ -396,13 +421,9 @@ class TradingBot:
                     self.metrics.log_trade(trade)
                     break
 
-            logger.info(
-                "Summary: %s",
-                self.metrics.summary(self.executor.portfolio),
-            )
-
+            logger.info("Summary: %s", self.metrics.summary(self.executor.portfolio))
         except Exception as e:
-            logger.error("Settlement error: %s", e)
+            logger.error("Finalize settlement error for %s: %s", market.slug, e)
 
 
 def main():

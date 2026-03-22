@@ -2,58 +2,53 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from bot.market.models import PortfolioState, TradeRecord
+if TYPE_CHECKING:
+    from bot.db import Database
+    from bot.market.models import PortfolioState
 
 logger = logging.getLogger(__name__)
 
 
 class MetricsTracker:
-    def __init__(self, log_file: str = "trades.jsonl"):
-        self.log_file = Path(log_file)
+    def __init__(self, db: Database):
+        self.db = db
         self._session_start = time.time()
-        self._historical = self._load_history()
 
-    def _load_history(self) -> list[dict]:
-        """Load all trades from the JSONL log file."""
-        trades = []
-        if self.log_file.exists():
-            for line in self.log_file.read_text().strip().splitlines():
-                try:
-                    trades.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        return trades
+    async def log_trade_from_values(
+        self,
+        timestamp: float,
+        market_slug: str,
+        direction: str,
+        amount_usd: float,
+        entry_price: float,
+        edge: float = 0.0,
+        outcome: str | None = None,
+        pnl: float = 0.0,
+        order_id: str | None = None,
+    ):
+        """Log a trade to the database."""
+        await self.db.insert_trade(
+            timestamp=timestamp,
+            market_slug=market_slug,
+            direction=direction,
+            amount_usd=amount_usd,
+            entry_price=entry_price,
+            edge=edge,
+            outcome=outcome,
+            pnl=pnl,
+            order_id=order_id,
+        )
 
-    def log_trade(self, trade: TradeRecord):
-        entry = {
-            "timestamp": trade.timestamp,
-            "market": trade.market_slug,
-            "direction": trade.direction.value,
-            "amount": trade.amount_usd,
-            "entry_price": trade.entry_price,
-            "edge": trade.edge,
-            "outcome": trade.outcome,
-            "pnl": trade.pnl,
-        }
-        with open(self.log_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        self._historical.append(entry)
-
-    def _stats(self) -> tuple[int, int]:
-        """Return (total_trades, wins) from historical log."""
-        total = len(self._historical)
-        wins = sum(1 for t in self._historical if t.get("outcome") == "win")
-        return total, wins
-
-    def summary(self, portfolio: PortfolioState) -> str:
-        total, wins = self._stats()
+    async def summary(self, portfolio: PortfolioState) -> str:
+        stats = await self.db.get_trade_stats()
+        total = stats["total"]
+        wins = stats["wins"]
         elapsed = time.time() - self._session_start
-        win_rate = wins / total if total else 0.0
+        win_rate = stats["win_rate"]
 
         lines = [
             f"Session: {elapsed / 3600:.1f}h",
@@ -65,12 +60,14 @@ class MetricsTracker:
         ]
         return " | ".join(lines)
 
-    def format_telegram(self, portfolio: PortfolioState) -> str:
-        total, wins = self._stats()
-        win_rate = wins / total if total else 0.0
+    async def format_telegram(self, portfolio: PortfolioState) -> str:
+        stats = await self.db.get_trade_stats()
+        total = stats["total"]
+        wins = stats["wins"]
+        win_rate = stats["win_rate"]
 
         return (
-            f"📊 <b>Bot Status</b>\n"
+            f"<b>Bot Status</b>\n"
             f"Balance: <code>${portfolio.balance_usd:.2f}</code>\n"
             f"Trades: {total} ({wins}W/{total - wins}L)\n"
             f"Win rate: {win_rate:.1%}\n"

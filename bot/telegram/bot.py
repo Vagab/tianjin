@@ -28,6 +28,7 @@ class TelegramNotifier:
         self._metrics: MetricsTracker | None = None
         self._risk_manager: RiskManager | None = None
         self._stop_callback = None
+        self._webhook_mode = False
 
     def set_dependencies(
         self,
@@ -43,7 +44,7 @@ class TelegramNotifier:
         self._stop_callback = stop_callback
         self._balance_refresher = balance_refresher
 
-    async def start(self):
+    async def start(self, webhook_base_url: str = ""):
         if not self.token or not self.chat_id:
             logger.warning("Telegram not configured — notifications disabled")
             return
@@ -57,32 +58,65 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("start", self._cmd_start))
         self._app.add_handler(CallbackQueryHandler(self._handle_button))
 
-        await self._app.initialize()
-        await self._app.start()
         try:
-            await self._app.updater.start_polling(drop_pending_updates=True)
-        except telegram.error.Conflict:
-            logger.warning("Telegram polling conflict — commands disabled, notifications still work")
+            await self._app.initialize()
+            await self._app.start()
 
-        await self.send("🤖 Bot started", with_buttons=True)
+            if webhook_base_url:
+                # Webhook mode: Telegram sends updates to our FastAPI endpoint
+                webhook_url = f"{webhook_base_url.rstrip('/')}/webhook/telegram"
+                await self._bot.set_webhook(url=webhook_url)
+                self._webhook_mode = True
+                logger.info("Telegram webhook set: %s", webhook_url)
+            else:
+                # Polling mode: for local development
+                try:
+                    await self._app.updater.start_polling(drop_pending_updates=True)
+                    logger.info("Telegram polling started — commands active")
+                except telegram.error.Conflict:
+                    logger.warning("Telegram polling conflict — commands disabled, notifications still work")
+        except Exception as e:
+            logger.warning("Telegram startup failed (%s) — notifications may be unavailable", e)
+            return
+
+        try:
+            await self.send("Bot started", with_buttons=True)
+        except Exception:
+            pass
 
     async def stop(self):
         if self._app:
-            await self.send("🛑 Bot stopping")
-            await self._app.updater.stop()
+            await self.send("Bot stopping")
+            if self._webhook_mode:
+                try:
+                    await self._bot.delete_webhook()
+                except Exception:
+                    pass
+            else:
+                try:
+                    await self._app.updater.stop()
+                except Exception:
+                    pass
             await self._app.stop()
             await self._app.shutdown()
+
+    async def process_update(self, data: dict):
+        """Process an incoming webhook update from FastAPI."""
+        if not self._app or not self._bot:
+            return
+        update = Update.de_json(data, self._bot)
+        await self._app.process_update(update)
 
     @staticmethod
     def _keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📊 Status", callback_data="status"),
-                InlineKeyboardButton("💰 PnL", callback_data="pnl"),
+                InlineKeyboardButton("Status", callback_data="status"),
+                InlineKeyboardButton("PnL", callback_data="pnl"),
             ],
             [
-                InlineKeyboardButton("🛑 Stop", callback_data="stop"),
-                InlineKeyboardButton("▶️ Start", callback_data="start"),
+                InlineKeyboardButton("Stop", callback_data="stop"),
+                InlineKeyboardButton("Start", callback_data="start"),
             ],
         ])
 
@@ -108,21 +142,21 @@ class TelegramNotifier:
         reasoning: str = "",
     ):
         text = (
-            f"🔔 <b>Trade Placed</b>\n"
+            f"<b>Trade Placed</b>\n"
             f"Direction: <code>{direction}</code>\n"
             f"Amount: <code>${amount:.2f}</code>\n"
             f"Edge: <code>{edge:.3f}</code>\n"
             f"Market: <code>{market}</code>"
         )
         if reasoning:
-            text += f"\n\n💡 <b>Why:</b> {reasoning}"
+            text += f"\n\n<b>Why:</b> {reasoning}"
         logger.info("Sending trade notification to Telegram")
         await self.send(text, with_buttons=True)
 
     async def notify_outcome(self, market: str, outcome: str, pnl: float, balance: float):
-        emoji = "✅" if outcome == "win" else "❌"
+        emoji = "W" if outcome == "win" else "L"
         await self.send(
-            f"{emoji} <b>{outcome.upper()}</b>\n"
+            f"<b>{outcome.upper()}</b>\n"
             f"Market: <code>{market}</code>\n"
             f"PnL: <code>${pnl:+.2f}</code>\n"
             f"Balance: <code>${balance:.2f}</code>",
@@ -130,10 +164,10 @@ class TelegramNotifier:
         )
 
     async def notify_error(self, error: str):
-        await self.send(f"⚠️ <b>Error</b>\n<code>{error}</code>")
+        await self.send(f"<b>Error</b>\n<code>{error}</code>")
 
     async def notify_circuit_breaker(self, reason: str):
-        await self.send(f"🚨 <b>Circuit Breaker</b>\n<code>{reason}</code>")
+        await self.send(f"<b>Circuit Breaker</b>\n<code>{reason}</code>")
 
     async def _handle_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -141,18 +175,21 @@ class TelegramNotifier:
             return
         await query.answer()
 
-        if query.data == "status":
-            await self._reply_status(query.message)
-        elif query.data == "pnl":
-            await self._reply_pnl(query.message)
-        elif query.data == "stop":
-            if self._risk_manager:
-                self._risk_manager.force_halt()
-            await query.message.reply_text("🛑 Trading halted")
-        elif query.data == "start":
-            if self._risk_manager:
-                self._risk_manager.resume()
-            await query.message.reply_text("▶️ Trading resumed")
+        try:
+            if query.data == "status":
+                await self._reply_status(query.message)
+            elif query.data == "pnl":
+                await self._reply_pnl(query.message)
+            elif query.data == "stop":
+                if self._risk_manager:
+                    self._risk_manager.force_halt()
+                await query.message.reply_text("Trading halted")
+            elif query.data == "start":
+                if self._risk_manager:
+                    self._risk_manager.resume()
+                await query.message.reply_text("Trading resumed")
+        except Exception as e:
+            logger.error("Button handler failed: %s", e)
 
     async def _reply_status(self, message):
         if self._portfolio_getter and self._metrics:
@@ -163,7 +200,7 @@ class TelegramNotifier:
                 except Exception:
                     pass
             portfolio = self._portfolio_getter()
-            text = self._metrics.format_telegram(portfolio)
+            text = await self._metrics.format_telegram(portfolio)
             await message.reply_text(text, parse_mode="HTML", reply_markup=self._keyboard())
         else:
             await message.reply_text("Bot not fully initialized")
@@ -177,9 +214,9 @@ class TelegramNotifier:
                     pass
             portfolio = self._portfolio_getter()
             await message.reply_text(
-                f"💰 Daily: <code>${portfolio.daily_pnl:+.2f}</code>\n"
-                f"💰 Total: <code>${portfolio.total_pnl:+.2f}</code>\n"
-                f"💰 Balance: <code>${portfolio.balance_usd:.2f}</code>",
+                f"Daily: <code>${portfolio.daily_pnl:+.2f}</code>\n"
+                f"Total: <code>${portfolio.total_pnl:+.2f}</code>\n"
+                f"Balance: <code>${portfolio.balance_usd:.2f}</code>",
                 parse_mode="HTML",
                 reply_markup=self._keyboard(),
             )
@@ -199,7 +236,7 @@ class TelegramNotifier:
             return
         if self._risk_manager:
             self._risk_manager.force_halt()
-            await update.message.reply_text("🛑 Trading halted")
+            await update.message.reply_text("Trading halted")
         if self._stop_callback:
             self._stop_callback()
 
@@ -208,4 +245,4 @@ class TelegramNotifier:
             return
         if self._risk_manager:
             self._risk_manager.resume()
-            await update.message.reply_text("▶️ Trading resumed")
+            await update.message.reply_text("Trading resumed")

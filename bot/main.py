@@ -9,7 +9,10 @@ import signal
 import time
 from pathlib import Path
 
+import uvicorn
+
 from config.settings import settings
+from bot.db import Database
 from bot.market.discovery import MarketDiscovery
 from bot.market.models import Direction, Market
 from bot.price.feed import BtcPriceFeed
@@ -20,12 +23,15 @@ from bot.risk.manager import RiskManager
 from bot.telegram.bot import TelegramNotifier
 from bot.utils.logging import setup_logging
 from bot.utils.metrics import MetricsTracker
+from bot.api.app import create_app
+from bot.api.ws import ws_manager
 
 logger = logging.getLogger(__name__)
 
 
 class TradingBot:
-    def __init__(self):
+    def __init__(self, db: Database):
+        self.db = db
         self.discovery = MarketDiscovery(interval_seconds=settings.interval_seconds)
         self.price_feed = BtcPriceFeed(ws_url=settings.binance_ws_url)
         self.strategy = MomentumStrategy(
@@ -42,12 +48,13 @@ class TradingBot:
             kelly_fraction=settings.kelly_fraction,
             min_edge=settings.min_edge,
         )
-        self.metrics = MetricsTracker()
+        self.metrics = MetricsTracker(db=db)
         self.telegram = TelegramNotifier(
             token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
         )
 
+        self._need_start_feeds = False
         if settings.paper_trading:
             self.executor = PaperExecutor(initial_balance=1000.0)
             logger.info("Running in PAPER trading mode")
@@ -66,22 +73,36 @@ class TradingBot:
                 builder_passphrase=settings.polymarket_builder_passphrase,
                 fill_timeout=float(settings.order_fill_timeout_seconds),
             )
+            self._need_start_feeds = True
             logger.info("Running in LIVE trading mode")
 
         self._running = False
+        self._start_time: float = 0
+        self._current_market: Market | None = None
         self._last_daily_reset: float = 0
-        self._pending_settlements: list[dict] = []  # queued for background resolution
-        self._state_file = Path(__file__).resolve().parent.parent / "bot_state.json"
-        self._traded_file = Path(__file__).resolve().parent.parent / "traded_markets.json"
-        self._traded_markets: set[str] = self._load_traded_markets()
+        self._pending_settlements: list[dict] = []
+        self._traded_markets: set[str] = set()
+        self._last_price_sample: float = 0.0
 
     async def start(self):
         self._running = True
+        self._start_time = time.time()
+
+        # Load traded markets from DB
+        self._traded_markets = await self.db.get_traded_slugs()
 
         # Start Binance BTC price feed
         await self.price_feed.start()
         await self.price_feed.wait_for_price()
         logger.info("BTC price feed active: $%.2f", self.price_feed.current_price)
+
+        # Register price tick callbacks for WebSocket + DB sampling
+        self.price_feed.on_price(self._on_price_tick)
+
+        # Start UserFeed WebSocket for fill confirmation
+        if self._need_start_feeds and hasattr(self.executor, "start_feeds"):
+            await self.executor.start_feeds()
+            logger.info("UserFeed started for fill confirmation")
 
         # Wire up Telegram
         portfolio_getter = lambda: (
@@ -94,14 +115,16 @@ class TradingBot:
             stop_callback=self.stop,
             balance_refresher=self._refresh_balance,
         )
-        await self.telegram.start()
+        await self.telegram.start(webhook_base_url=settings.webhook_base_url)
 
         balance = await self.executor.get_balance()
-        self._load_or_init_state(balance)
+        await self._load_or_init_state(balance)
         logger.info("Starting balance: $%.2f (initial: $%.2f)", balance, self._initial_balance)
 
-        # Start background settlement resolver
+        # Start background tasks
         self._settle_task = asyncio.create_task(self._background_settle())
+        self._equity_task = asyncio.create_task(self._equity_snapshot_loop())
+        self._cleanup_task = asyncio.create_task(self._db_cleanup_loop())
 
         # Main loop
         try:
@@ -110,59 +133,99 @@ class TradingBot:
             logger.info("Bot cancelled")
         finally:
             self._settle_task.cancel()
+            self._equity_task.cancel()
+            self._cleanup_task.cancel()
             await self._shutdown()
 
     def stop(self):
         self._running = False
 
-    def _load_or_init_state(self, current_balance: float):
-        """Load persisted state (initial balance, daily start) or initialize."""
+    def _on_price_tick(self, tick):
+        """Callback from BtcPriceFeed — broadcast to WebSocket + sample to DB."""
+        # Schedule the async broadcast on the event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(ws_manager.broadcast_price(tick.price, tick.timestamp, tick.volume))
+        except RuntimeError:
+            pass
+
+        # Sample price ticks to DB every 5 seconds
+        now = time.time()
+        if now - self._last_price_sample >= 5.0:
+            self._last_price_sample = now
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.db.insert_price_tick(tick.timestamp, tick.price, tick.volume))
+            except RuntimeError:
+                pass
+
+    async def _equity_snapshot_loop(self):
+        """Snapshot portfolio state every 60 seconds."""
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+                portfolio = self.executor.portfolio
+                await self.db.insert_equity_snapshot(
+                    timestamp=time.time(),
+                    balance_usd=portfolio.balance_usd,
+                    daily_pnl=portfolio.daily_pnl,
+                    total_pnl=portfolio.total_pnl,
+                    open_exposure=portfolio.open_exposure,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Equity snapshot error: %s", e)
+
+    async def _db_cleanup_loop(self):
+        """Periodic cleanup of old price ticks and equity snapshots."""
+        while self._running:
+            try:
+                await asyncio.sleep(3600)  # every hour
+                await self.db.cleanup_price_ticks()
+                await self.db.cleanup_equity_snapshots()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("DB cleanup error: %s", e)
+
+    async def _load_or_init_state(self, current_balance: float):
+        """Load persisted state from DB or initialize."""
         import datetime
         today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        try:
-            data = json.loads(self._state_file.read_text())
-            self._initial_balance = data["initial_balance"]
-            if data.get("daily_date") == today:
-                self._daily_start_balance = data["daily_start_balance"]
+
+        state = await self.db.load_bot_state()
+        if state:
+            self._initial_balance = state["initial_balance"]
+            if state.get("daily_date") == today:
+                self._daily_start_balance = state["daily_start_balance"]
             else:
                 self._daily_start_balance = current_balance
-                data["daily_start_balance"] = current_balance
-                data["daily_date"] = today
-                self._state_file.write_text(json.dumps(data))
-            # Prevent daily reset from re-triggering on restart
+                await self.db.upsert_bot_state(
+                    self._initial_balance, current_balance, today,
+                )
             self._last_daily_reset = datetime.datetime.now(datetime.timezone.utc).date().toordinal()
             logger.info("Loaded state: initial=$%.2f daily_start=$%.2f", self._initial_balance, self._daily_start_balance)
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        else:
             self._initial_balance = current_balance
             self._daily_start_balance = current_balance
             self._last_daily_reset = datetime.datetime.now(datetime.timezone.utc).date().toordinal()
-            self._save_state()
+            await self._save_state()
             logger.info("Initialized state: balance=$%.2f", current_balance)
 
-    def _load_traded_markets(self) -> set[str]:
-        """Load set of market slugs we've already traded (survives restarts)."""
-        try:
-            data = json.loads(self._traded_file.read_text())
-            return set(data.get("markets", []))
-        except (FileNotFoundError, json.JSONDecodeError):
-            return set()
-
-    def _mark_traded(self, market_slug: str):
-        """Record that we've traded this market window."""
-        self._traded_markets.add(market_slug)
-        # Keep only the last 20 to avoid unbounded growth
-        if len(self._traded_markets) > 20:
-            self._traded_markets = set(list(self._traded_markets)[-20:])
-        self._traded_file.write_text(json.dumps({"markets": list(self._traded_markets)}))
-
-    def _save_state(self):
+    async def _save_state(self):
         import datetime
         today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        self._state_file.write_text(json.dumps({
-            "initial_balance": self._initial_balance,
-            "daily_start_balance": self._daily_start_balance,
-            "daily_date": today,
-        }))
+        await self.db.upsert_bot_state(
+            self._initial_balance, self._daily_start_balance, today,
+        )
+
+    async def _mark_traded(self, market_slug: str):
+        """Record that we've traded this market window."""
+        self._traded_markets.add(market_slug)
+        await self.db.mark_traded(market_slug)
 
     def _sync_pnl(self):
         """Update portfolio PnL from actual balance difference."""
@@ -180,9 +243,11 @@ class TradingBot:
         await self.price_feed.stop()
         await self.telegram.stop()
         await self.discovery.close()
+        await self.db.close()
 
         if hasattr(self.executor, "portfolio"):
-            logger.info("Final: %s", self.metrics.summary(self.executor.portfolio))
+            summary = await self.metrics.summary(self.executor.portfolio)
+            logger.info("Final: %s", summary)
 
     async def _run_loop(self):
         while self._running:
@@ -194,7 +259,7 @@ class TradingBot:
                 self._last_daily_reset = today_key
                 self.risk.reset_daily()
                 self._daily_start_balance = self.executor.portfolio.balance_usd
-                self._save_state()
+                await self._save_state()
                 self._sync_pnl()
                 logger.info("Daily reset (daily_start=$%.2f)", self._daily_start_balance)
 
@@ -212,6 +277,8 @@ class TradingBot:
             logger.warning("No active market found, waiting...")
             await asyncio.sleep(30)
             return
+
+        self._current_market = market
 
         # Skip markets we've already traded (prevents duplicates on restart)
         if market.slug in self._traded_markets:
@@ -257,7 +324,18 @@ class TradingBot:
                 fresh_market = await self.discovery.get_current_market()
                 if fresh_market:
                     market = fresh_market
+                    self._current_market = market
                 last_refresh = now_t
+
+                # Fetch live CLOB ask price and update market object
+                if hasattr(self.executor, "get_book_price"):
+                    try:
+                        live_ask = self.executor.get_book_price(market.up_token.token_id)
+                        if live_ask and 0.01 < live_ask < 0.99:
+                            market.up_token.price = live_ask
+                            market.down_token.price = round(1.0 - live_ask, 4)
+                    except Exception:
+                        pass  # fall back to Gamma price
 
             signal = await self.strategy.evaluate(market, self.price_feed, window_open_price)
 
@@ -268,8 +346,24 @@ class TradingBot:
                         "Signal flipped %s → %s, cancelling order %s",
                         current_direction.value, signal.direction.value, current_order_id,
                     )
+                    cancel_result = "error"
                     if hasattr(self.executor, "cancel_order"):
-                        self.executor.cancel_order(current_order_id)
+                        cancel_result = self.executor.cancel_order(current_order_id)
+                    if cancel_result == "already_matched":
+                        logger.warning(
+                            "Order %s was already matched — treating as filled, blocking opposite trade",
+                            current_order_id[:16] if current_order_id else "?",
+                        )
+                        traded = True
+                        await self._mark_traded(market.slug)
+                        await self.telegram.notify_trade(
+                            direction=current_direction.value,
+                            amount=0,
+                            edge=signal.edge,
+                            market=market.slug,
+                            reasoning="Filled (detected via cancel response)",
+                        )
+                        break
                     current_order_id = None
                     current_direction = None
 
@@ -283,7 +377,7 @@ class TradingBot:
                 risk_check = self.risk.check(signal, portfolio)
 
                 if risk_check.allowed:
-                    # 5. EXECUTE
+                    # 5. EXECUTE (market prices already contain live CLOB prices)
                     result = await self.executor.execute(
                         market, signal.direction, risk_check.position_size,
                         edge=signal.edge,
@@ -291,7 +385,7 @@ class TradingBot:
 
                     if result.success:
                         traded = True
-                        self._mark_traded(market.slug)
+                        await self._mark_traded(market.slug)
                         current_order_id = result.order_id
                         current_direction = signal.direction
                         # Sync balance and PnL from Polymarket
@@ -311,10 +405,28 @@ class TradingBot:
                             market=market.slug,
                             reasoning=signal.reasoning,
                         )
+                        # Log trade to DB + broadcast
+                        await self.metrics.log_trade_from_values(
+                            timestamp=time.time(),
+                            market_slug=market.slug,
+                            direction=signal.direction.value,
+                            amount_usd=risk_check.position_size,
+                            entry_price=result.fill_price or 0,
+                            edge=signal.edge,
+                        )
+                        await ws_manager.broadcast_trade({
+                            "market_slug": market.slug,
+                            "direction": signal.direction.value,
+                            "amount_usd": risk_check.position_size,
+                            "edge": signal.edge,
+                        })
                     else:
                         current_order_id = result.order_id or "unknown"
                         current_direction = signal.direction
                         logger.warning("Order failed: %s — won't retry this direction", result.error)
+                        await self.telegram.notify_error(
+                            f"Order failed: {result.error} | {signal.direction.value} on {market.slug}"
+                        )
                 else:
                     logger.debug("Risk blocked: %s", risk_check.reason)
 
@@ -418,32 +530,68 @@ class TradingBot:
                         pnl=trade.pnl,
                         balance=self.executor.portfolio.balance_usd,
                     )
-                    self.metrics.log_trade(trade)
+                    # Update trade outcome in DB
+                    await self.db.update_trade_outcome(
+                        market.slug, trade.outcome, trade.pnl,
+                    )
+                    # Broadcast settlement via WebSocket
+                    await ws_manager.broadcast_settlement(
+                        market.slug, trade.outcome, trade.pnl,
+                    )
+                    await ws_manager.broadcast_portfolio({
+                        "balance_usd": self.executor.portfolio.balance_usd,
+                        "daily_pnl": self.executor.portfolio.daily_pnl,
+                        "total_pnl": self.executor.portfolio.total_pnl,
+                    })
                     break
             if not matched:
                 logger.warning("No trade found for %s in %d trades", market.slug,
                                len(self.executor.portfolio.trades))
 
-            logger.info("Summary: %s", self.metrics.summary(self.executor.portfolio))
+            summary = await self.metrics.summary(self.executor.portfolio)
+            logger.info("Summary: %s", summary)
         except Exception as e:
             logger.error("Post-settlement error for %s: %s", market.slug, e)
 
 
 def main():
     setup_logging()
-    bot = TradingBot()
 
     loop = asyncio.new_event_loop()
 
+    async def _run():
+        db = Database(settings.db_path)
+        await db.init()
+        await db.migrate_from_json()
+
+        bot = TradingBot(db=db)
+        app = create_app(bot, db)
+
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=settings.api_port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+
+        # Run API server and trading bot concurrently
+        await asyncio.gather(
+            server.serve(),
+            bot.start(),
+        )
+
     def handle_signal(sig, frame):
         logger.info("Received signal %s, stopping...", sig)
-        bot.stop()
+        # Cancel all tasks
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        loop.run_until_complete(bot.start())
+        loop.run_until_complete(_run())
     finally:
         loop.close()
 

@@ -29,24 +29,29 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    webhook_base_url: str = ""  # e.g. "https://tianjin.example.com"; empty = polling
+
+    # API / Database
+    db_path: str = "data/tianjin.db"
+    api_port: int = 8000
 
     # Trading
     paper_trading: bool = False
-    market_interval: Literal["5m", "15m"] = "5m"
-    order_type: str = "GTC"
+    market_interval: Literal["5m", "15m"] = "15m"
+    order_type: str = "FOK"
 
     # Risk
     max_position_usd: float = 300.0
     max_exposure_usd: float = 1000.0
     max_daily_loss_usd: float = 200.0
-    kelly_fraction: float = 0.60
-    min_edge: float = 0.03
+    kelly_fraction: float = 0.40
+    min_edge: float = 0.02
     estimated_taker_fee_pct: float = 0.02
 
     # Strategy
-    momentum_lookback_seconds: int = 45
-    momentum_min_move_pct: float = 0.05
-    max_entry_window_pct: float = 0.75
+    momentum_lookback_seconds: int = 120
+    momentum_min_move_pct: float = 0.02
+    max_entry_window_pct: float = 0.20
     htf_filter: bool = True
 
     @property

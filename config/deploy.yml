@@ -1,0 +1,57 @@
+service: tianjin
+
+image: vagab/tianjin
+
+servers:
+  web:
+    - 178.104.74.247
+
+proxy:
+  ssl: true
+  host: poly.barseek.me
+  app_port: 8000
+  healthcheck:
+    path: /api/v1/status
+    interval: 3
+    timeout: 5
+
+registry:
+  server: ghcr.io
+  username: vagab
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: amd64
+  remote: ssh://root@178.104.74.247
+
+env:
+  clear:
+    DB_PATH: /app/data/tianjin.db
+  secret:
+    - POLYMARKET_PRIVATE_KEY
+    - POLYMARKET_CHAIN_ID
+    - POLYMARKET_FUNDER
+    - POLYMARKET_BUILDER_API_KEY
+    - POLYMARKET_BUILDER_SECRET
+    - POLYMARKET_BUILDER_PASSPHRASE
+    - TELEGRAM_BOT_TOKEN
+    - TELEGRAM_CHAT_ID
+    - WEBHOOK_BASE_URL
+    - PAPER_TRADING
+    - MAX_POSITION_USD
+    - MAX_EXPOSURE_USD
+    - MAX_DAILY_LOSS_USD
+    - KELLY_FRACTION
+    - MIN_EDGE
+    - MARKET_INTERVAL
+    - ESTIMATED_TAKER_FEE_PCT
+    - MOMENTUM_LOOKBACK_SECONDS
+    - MOMENTUM_MIN_MOVE_PCT
+    - MAX_ENTRY_WINDOW_PCT
+
+ssh:
+  keys: ["~/.ssh/hetzner/id_ed25519"]
+
+volumes:
+  - /opt/tianjin/data:/app/data

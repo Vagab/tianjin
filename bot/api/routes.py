@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
+from pydantic import BaseModel
 
 from bot.api.models import (
     EquitySnapshotResponse,
@@ -29,6 +30,98 @@ def _get_db(request: Request):
     return request.app.state.db
 
 
+def _get_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+# --- Auth ---
+
+class LoginRequest(BaseModel):
+    key: str
+
+
+@router.post("/auth/signup")
+async def signup(request: Request, response: Response):
+    db = _get_db(request)
+    ip = _get_ip(request)
+
+    # Rate limit: max 5 signups per IP per hour
+    failures = await db.count_recent_failures(ip, window_seconds=3600)
+    if failures > 20:
+        return Response(
+            content='{"error":"too many attempts, try again later"}',
+            status_code=429,
+            media_type="application/json",
+        )
+
+    account_id, uid, key = await db.create_account()
+    token = await db.create_session(account_id, ip)
+    await db.record_auth_attempt(ip, success=True)
+
+    response.set_cookie(
+        "session", token,
+        httponly=True, samesite="lax", secure=True, max_age=30 * 86400,
+    )
+    return {"uid": uid, "key": key, "token": token}
+
+
+@router.post("/auth/login")
+async def login(request: Request, body: LoginRequest, response: Response):
+    db = _get_db(request)
+    ip = _get_ip(request)
+
+    # Rate limit: max 10 failed attempts per IP per 15 min
+    failures = await db.count_recent_failures(ip, window_seconds=900)
+    if failures >= 10:
+        return Response(
+            content='{"error":"too many failed attempts, try again in 15 minutes"}',
+            status_code=429,
+            media_type="application/json",
+        )
+
+    # Strip spaces/dashes from key
+    key = body.key.replace(" ", "").replace("-", "")
+
+    account = await db.authenticate(key)
+    if not account:
+        await db.record_auth_attempt(ip, success=False)
+        return Response(
+            content='{"error":"invalid key"}',
+            status_code=401,
+            media_type="application/json",
+        )
+
+    await db.record_auth_attempt(ip, success=True)
+    token = await db.create_session(account["id"], ip)
+
+    response.set_cookie(
+        "session", token,
+        httponly=True, samesite="lax", secure=True, max_age=30 * 86400,
+    )
+    return {"uid": account["uid"], "token": token}
+
+
+@router.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get("session")
+    if token:
+        db = _get_db(request)
+        await db.delete_session(token)
+    response.delete_cookie("session")
+    return {"ok": True}
+
+
+@router.get("/auth/me")
+async def me(request: Request):
+    account = request.state.account
+    return {"uid": account["uid"]}
+
+
+# --- Portfolio ---
+
 @router.get("/portfolio", response_model=PortfolioResponse)
 async def get_portfolio(request: Request):
     bot = _get_bot(request)
@@ -42,6 +135,8 @@ async def get_portfolio(request: Request):
         win_rate=portfolio.win_rate,
     )
 
+
+# --- Trades ---
 
 @router.get("/trades", response_model=TradesListResponse)
 async def get_trades(
@@ -68,6 +163,17 @@ async def get_trade_stats(request: Request):
     return TradeStatsResponse(**stats)
 
 
+@router.get("/trades/{uid}")
+async def get_trade_by_uid(request: Request, uid: str):
+    db = _get_db(request)
+    trade = await db.get_trade_by_uid(uid)
+    if not trade:
+        return Response(content='{"error":"not found"}', status_code=404, media_type="application/json")
+    return TradeResponse(**trade)
+
+
+# --- Status ---
+
 @router.get("/status", response_model=StatusResponse)
 async def get_status(request: Request):
     bot = _get_bot(request)
@@ -86,6 +192,8 @@ async def get_status(request: Request):
     )
 
 
+# --- Risk ---
+
 @router.get("/risk", response_model=RiskResponse)
 async def get_risk(request: Request):
     bot = _get_bot(request)
@@ -101,6 +209,8 @@ async def get_risk(request: Request):
     )
 
 
+# --- Prices ---
+
 @router.get("/prices", response_model=list[PriceTickResponse])
 async def get_prices(
     request: Request,
@@ -108,10 +218,12 @@ async def get_prices(
 ):
     db = _get_db(request)
     if since <= 0:
-        since = time.time() - 86400  # default: last 24h
+        since = time.time() - 86400
     ticks = await db.get_price_ticks(since)
     return [PriceTickResponse(**t) for t in ticks]
 
+
+# --- Equity ---
 
 @router.get("/equity", response_model=list[EquitySnapshotResponse])
 async def get_equity(
@@ -120,10 +232,12 @@ async def get_equity(
 ):
     db = _get_db(request)
     if since <= 0:
-        since = time.time() - 7 * 86400  # default: last 7 days
+        since = time.time() - 7 * 86400
     snapshots = await db.get_equity_snapshots(since)
     return [EquitySnapshotResponse(**s) for s in snapshots]
 
+
+# --- Market ---
 
 @router.get("/market")
 async def get_market(request: Request):
@@ -141,6 +255,8 @@ async def get_market(request: Request):
         )
     return {"market": None}
 
+
+# --- Controls ---
 
 @router.post("/control/halt")
 async def halt_trading(request: Request):

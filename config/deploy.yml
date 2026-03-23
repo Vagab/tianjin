@@ -1,10 +1,10 @@
-service: tianjin
+service: poly
 
-image: vagab/tianjin
+image: vagab/poly
 
 servers:
   web:
-    - 178.104.74.247
+    - 157.180.39.160
 
 proxy:
   ssl: true
@@ -23,11 +23,11 @@ registry:
 
 builder:
   arch: amd64
-  remote: ssh://root@178.104.74.247
+  remote: ssh://root@157.180.39.160
 
 env:
   clear:
-    DB_PATH: /app/data/tianjin.db
+    DB_PATH: /app/data/poly.db
   secret:
     - POLYMARKET_PRIVATE_KEY
     - POLYMARKET_CHAIN_ID
@@ -50,8 +50,5 @@ env:
     - MOMENTUM_MIN_MOVE_PCT
     - MAX_ENTRY_WINDOW_PCT
 
-ssh:
-  keys: ["/app/keys/id_ed25519"]
-
 volumes:
-  - /opt/tianjin/data:/app/data
+  - /opt/poly/data:/app/data

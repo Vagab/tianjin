@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from bot.api.auth import AuthMiddleware
 from bot.api.routes import router as api_router
 from bot.api.ws import ws_endpoint
 
@@ -24,7 +25,7 @@ FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "di
 
 
 def create_app(bot: TradingBot, db: Database) -> FastAPI:
-    app = FastAPI(title="Tianjin Dashboard API", docs_url="/api/docs")
+    app = FastAPI(title="Poly Dashboard API", docs_url="/api/docs")
 
     app.state.bot = bot
     app.state.db = db
@@ -33,9 +34,13 @@ def create_app(bot: TradingBot, db: Database) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Auth middleware
+    app.add_middleware(AuthMiddleware)
 
     # API routes
     app.include_router(api_router, prefix="/api/v1")
@@ -60,17 +65,15 @@ def create_app(bot: TradingBot, db: Database) -> FastAPI:
         # SPA catch-all: serve index.html for any non-API route
         @app.get("/{path:path}")
         async def serve_spa(path: str):
-            # Try to serve the exact file first
             file_path = FRONTEND_DIST / path
             if path and file_path.exists() and file_path.is_file():
                 return FileResponse(file_path)
-            # Fall back to index.html for SPA routing
             return FileResponse(FRONTEND_DIST / "index.html")
     else:
         @app.get("/")
         async def no_frontend():
             return HTMLResponse(
-                "<h1>Tianjin Dashboard</h1>"
+                "<h1>Poly Dashboard</h1>"
                 "<p>Frontend not built. Run <code>cd frontend && npm run build</code></p>"
                 "<p><a href='/api/docs'>API Docs</a></p>"
             )

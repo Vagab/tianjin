@@ -16,6 +16,7 @@ class PortfolioResponse(BaseModel):
 
 class TradeResponse(BaseModel):
     id: int
+    uid: str
     timestamp: float
     market_slug: str
     direction: str

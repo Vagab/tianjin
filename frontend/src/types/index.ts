@@ -9,6 +9,7 @@ export interface Portfolio {
 
 export interface Trade {
   id: number
+  uid: string
   timestamp: number
   market_slug: string
   direction: 'UP' | 'DOWN'
@@ -77,6 +78,12 @@ export interface EquitySnapshot {
   daily_pnl: number
   total_pnl: number
   open_exposure: number
+}
+
+export interface AuthResponse {
+  uid: string
+  key?: string
+  token: string
 }
 
 export type WsMessage =

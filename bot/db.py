@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import secrets
 import time
+import uuid
 from pathlib import Path
 
 import aiosqlite
@@ -14,6 +17,7 @@ logger = logging.getLogger(__name__)
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(8)))),
     timestamp REAL NOT NULL,
     market_slug TEXT NOT NULL,
     direction TEXT NOT NULL CHECK (direction IN ('UP', 'DOWN')),
@@ -23,10 +27,13 @@ CREATE TABLE IF NOT EXISTS trades (
     outcome TEXT CHECK (outcome IN ('win', 'loss') OR outcome IS NULL),
     pnl REAL NOT NULL DEFAULT 0,
     order_id TEXT,
+    account_id INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_slug);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_uid ON trades(uid);
+CREATE INDEX IF NOT EXISTS idx_trades_account ON trades(account_id);
 
 CREATE TABLE IF NOT EXISTS bot_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -58,7 +65,46 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     open_exposure REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL UNIQUE,
+    key_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_uid ON accounts(uid);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_key ON accounts(key_hash);
+
+CREATE TABLE IF NOT EXISTS auth_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT NOT NULL,
+    attempted_at REAL NOT NULL,
+    success INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_auth_ip ON auth_attempts(ip, attempted_at);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    ip TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
 """
+
+
+def _hash_key(key: str) -> str:
+    """Hash an account key with SHA-256."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def generate_account_key() -> str:
+    """Generate a 16-digit numeric key (Mullvad style)."""
+    return "".join(str(secrets.randbelow(10)) for _ in range(16))
 
 
 class Database:
@@ -81,6 +127,82 @@ class Database:
         if self._db:
             await self._db.close()
 
+    # --- Auth ---
+
+    async def create_account(self) -> tuple[int, str, str]:
+        """Create a new account. Returns (id, uid, plaintext_key)."""
+        key = generate_account_key()
+        key_hash = _hash_key(key)
+        uid = uuid.uuid4().hex[:12]
+        cursor = await self._db.execute(
+            "INSERT INTO accounts (uid, key_hash) VALUES (?, ?)",
+            (uid, key_hash),
+        )
+        await self._db.commit()
+        return cursor.lastrowid, uid, key
+
+    async def authenticate(self, key: str) -> dict | None:
+        """Authenticate with a 16-digit key. Returns account dict or None."""
+        key_hash = _hash_key(key)
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM accounts WHERE key_hash = ?", (key_hash,),
+        )
+        if not rows:
+            return None
+        account = dict(rows[0])
+        await self._db.execute(
+            "UPDATE accounts SET last_seen_at = datetime('now') WHERE id = ?",
+            (account["id"],),
+        )
+        await self._db.commit()
+        return account
+
+    async def create_session(self, account_id: int, ip: str, ttl_seconds: int = 30 * 86400) -> str:
+        """Create a session token. Returns the token."""
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO sessions (token, account_id, ip, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (token, account_id, ip, now, now + ttl_seconds),
+        )
+        await self._db.commit()
+        return token
+
+    async def validate_session(self, token: str) -> dict | None:
+        """Validate a session token. Returns account dict or None."""
+        rows = await self._db.execute_fetchall(
+            """SELECT a.* FROM sessions s
+               JOIN accounts a ON a.id = s.account_id
+               WHERE s.token = ? AND s.expires_at > ?""",
+            (token, time.time()),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def delete_session(self, token: str):
+        await self._db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        await self._db.commit()
+
+    async def record_auth_attempt(self, ip: str, success: bool):
+        await self._db.execute(
+            "INSERT INTO auth_attempts (ip, attempted_at, success) VALUES (?, ?, ?)",
+            (ip, time.time(), 1 if success else 0),
+        )
+        await self._db.commit()
+
+    async def count_recent_failures(self, ip: str, window_seconds: int = 900) -> int:
+        """Count failed auth attempts from an IP in the last N seconds."""
+        cutoff = time.time() - window_seconds
+        rows = await self._db.execute_fetchall(
+            "SELECT COUNT(*) as cnt FROM auth_attempts WHERE ip = ? AND attempted_at > ? AND success = 0",
+            (ip, cutoff),
+        )
+        return rows[0]["cnt"] if rows else 0
+
+    async def cleanup_auth_attempts(self, max_age_seconds: float = 86400):
+        cutoff = time.time() - max_age_seconds
+        await self._db.execute("DELETE FROM auth_attempts WHERE attempted_at < ?", (cutoff,))
+        await self._db.commit()
+
     # --- Trades ---
 
     async def insert_trade(
@@ -94,13 +216,15 @@ class Database:
         outcome: str | None = None,
         pnl: float = 0.0,
         order_id: str | None = None,
+        account_id: int | None = None,
     ) -> int:
+        uid = uuid.uuid4().hex[:16]
         cursor = await self._db.execute(
-            """INSERT INTO trades (timestamp, market_slug, direction, amount_usd,
-               entry_price, edge, outcome, pnl, order_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (timestamp, market_slug, direction, amount_usd, entry_price,
-             edge, outcome, pnl, order_id),
+            """INSERT INTO trades (uid, timestamp, market_slug, direction, amount_usd,
+               entry_price, edge, outcome, pnl, order_id, account_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (uid, timestamp, market_slug, direction, amount_usd, entry_price,
+             edge, outcome, pnl, order_id, account_id),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -135,6 +259,12 @@ class Database:
                 (limit, offset),
             )
         return [dict(r) for r in rows]
+
+    async def get_trade_by_uid(self, uid: str) -> dict | None:
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM trades WHERE uid = ?", (uid,),
+        )
+        return dict(rows[0]) if rows else None
 
     async def get_all_trades(self) -> list[dict]:
         rows = await self._db.execute_fetchall(
@@ -290,11 +420,12 @@ class Database:
             for line in trades_file.read_text().strip().splitlines():
                 try:
                     t = json.loads(line)
+                    uid = uuid.uuid4().hex[:16]
                     await self._db.execute(
-                        """INSERT INTO trades (timestamp, market_slug, direction,
+                        """INSERT INTO trades (uid, timestamp, market_slug, direction,
                            amount_usd, entry_price, edge, outcome, pnl)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (t["timestamp"], t["market"], t["direction"],
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (uid, t["timestamp"], t["market"], t["direction"],
                          t["amount"], t["entry_price"], t.get("edge", 0),
                          t.get("outcome"), t.get("pnl", 0)),
                     )
@@ -332,3 +463,29 @@ class Database:
                 logger.info("Migrated %d traded markets", len(data.get("markets", [])))
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning("Failed to migrate traded_markets.json: %s", e)
+
+    # --- Backfill equity from trades ---
+
+    async def backfill_equity_from_trades(self, initial_balance: float):
+        """Reconstruct equity curve from historical trades."""
+        existing = await self._db.execute_fetchall(
+            "SELECT COUNT(*) as cnt FROM equity_snapshots",
+        )
+        if existing[0]["cnt"] > 0:
+            return
+
+        trades = await self.get_all_trades()
+        if not trades:
+            return
+
+        balance = initial_balance
+        for t in trades:
+            if t["outcome"] is not None:
+                balance += t["pnl"]
+                await self._db.execute(
+                    """INSERT INTO equity_snapshots (timestamp, balance_usd, daily_pnl, total_pnl, open_exposure)
+                       VALUES (?, ?, 0, ?, 0)""",
+                    (t["timestamp"], balance, balance - initial_balance),
+                )
+        await self._db.commit()
+        logger.info("Backfilled %d equity snapshots from trades", len(trades))

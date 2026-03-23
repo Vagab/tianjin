@@ -121,6 +121,9 @@ class TradingBot:
         await self._load_or_init_state(balance)
         logger.info("Starting balance: $%.2f (initial: $%.2f)", balance, self._initial_balance)
 
+        # Backfill equity curve from historical trades
+        await self.db.backfill_equity_from_trades(self._initial_balance)
+
         # Start background tasks
         self._settle_task = asyncio.create_task(self._background_settle())
         self._equity_task = asyncio.create_task(self._equity_snapshot_loop())
@@ -186,6 +189,7 @@ class TradingBot:
                 await asyncio.sleep(3600)  # every hour
                 await self.db.cleanup_price_ticks()
                 await self.db.cleanup_equity_snapshots()
+                await self.db.cleanup_auth_attempts()
             except asyncio.CancelledError:
                 break
             except Exception as e:

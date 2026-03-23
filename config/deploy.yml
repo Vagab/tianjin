@@ -50,8 +50,5 @@ env:
     - MOMENTUM_MIN_MOVE_PCT
     - MAX_ENTRY_WINDOW_PCT
 
-ssh:
-  keys: ["~/.ssh/hetzner/id_ed25519"]
-
 volumes:
   - /opt/tianjin/data:/app/data

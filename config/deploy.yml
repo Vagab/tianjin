@@ -23,7 +23,6 @@ registry:
 
 builder:
   arch: amd64
-  remote: ssh://root@157.180.39.160
 
 env:
   clear:

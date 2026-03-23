@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.27",
     "python-dotenv>=1.0",
     "python-telegram-bot>=21.0",
+    "poly-web3>=1.0",
 ]
 
 [project.optional-dependencies]
